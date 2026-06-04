@@ -81,22 +81,21 @@ logging.basicConfig(
 log = logging.getLogger("cupa-bot")
 
 # ------------------------------------------------------------------ #
-#  ECHIPELE ȘI GRUPELE
-#  >>> ÎNLOCUIEȘTE cu tragerea la sorți REALĂ a CM 2026 <<<
+#  ECHIPELE ȘI GRUPELE — Cupa Mondială 2026
 # ------------------------------------------------------------------ #
 TEAMS = {
-    "A": ["Mexic", "Canada", "SUA", "Wales"],
-    "B": ["Argentina", "Australia", "Polonia", "Arabia Saudită"],
-    "C": ["Franța", "Danemarca", "Tunisia", "Peru"],
-    "D": ["Anglia", "Senegal", "Iran", "Costa Rica"],
-    "E": ["Spania", "Germania", "Japonia", "Maroc"],
-    "F": ["Brazilia", "Elveția", "Serbia", "Camerun"],
-    "G": ["Portugalia", "Uruguay", "Coreea de Sud", "Ghana"],
-    "H": ["Belgia", "Croația", "Nigeria", "Panama"],
-    "I": ["Olanda", "Ecuador", "Egipt", "Qatar"],
-    "J": ["Italia", "Columbia", "Algeria", "Noua Zeelandă"],
-    "K": ["Țările de Jos B", "Norvegia", "Coasta de Fildeș", "Jamaica"],
-    "L": ["Turcia", "Suedia", "Paraguay", "Grecia"],
+    "A": ["Cehia", "Mexic", "Africa de Sud", "Coreea de Sud"],
+    "B": ["Elveția", "Bosnia și Herțegovina", "Canada", "Qatar"],
+    "C": ["Scoția", "Brazilia", "Haiti", "Maroc"],
+    "D": ["Turcia", "Paraguay", "SUA", "Australia"],
+    "E": ["Germania", "Ecuador", "Coasta de Fildeș", "Curacao"],
+    "F": ["Suedia", "Țările de Jos", "Tunisia", "Japonia"],
+    "G": ["Belgia", "Egipt", "Iran", "Noua Zeelandă"],
+    "H": ["Spania", "Uruguay", "Capul Verde", "Arabia Saudită"],
+    "I": ["Franța", "Norvegia", "Senegal", "Irak"],
+    "J": ["Austria", "Argentina", "Algeria", "Iordania"],
+    "K": ["Portugalia", "Columbia", "DR Congo", "Uzbekistan"],
+    "L": ["Croația", "Anglia", "Ghana", "Panama"],
 }
 
 # ------------------------------------------------------------------ #
