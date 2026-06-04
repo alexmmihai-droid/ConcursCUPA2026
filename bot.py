@@ -408,6 +408,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/approve <id sau @user> — aprobă participant\n"
             "/deny <id> — respinge/scoate participant\n"
             "/participanti — lista celor aprobați\n"
+            "/allpicks — pronosticurile tuturor (pe scurt)\n"
+            "/picks <id sau @user> — pronosticurile complete ale cuiva\n"
+            "/matchpicks <id_meci> — cine ce a pronosticat la un meci\n"
             "/addmatch Echipa1 | Echipa2 | YYYY-MM-DD HH:MM | Faza\n"
             "/setresult <id_meci> <HOME|DRAW|AWAY>\n"
             "/setgroupwinner <Grupa> <Echipa>\n"
@@ -808,6 +811,105 @@ async def cmd_participanti(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------ #
+#  COMENZI ADMIN — vizualizare pronosticuri
+# ------------------------------------------------------------------ #
+async def cmd_allpicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    with db() as c:
+        users = c.execute(
+            "SELECT user_id, full_name FROM users WHERE approved=1 ORDER BY full_name"
+        ).fetchall()
+        champs = dict(c.execute("SELECT user_id, team_name FROM champion_picks").fetchall())
+        gcounts = dict(c.execute("SELECT user_id, COUNT(*) FROM group_picks GROUP BY user_id").fetchall())
+        mcounts = dict(c.execute("SELECT user_id, COUNT(*) FROM match_predictions GROUP BY user_id").fetchall())
+    if not users:
+        await update.message.reply_text("Niciun participant aprobat.")
+        return
+    lines = ["📋 Pronosticuri — toți participanții\n"]
+    for u in users:
+        uid = u["user_id"]
+        lines.append(
+            f"• {u['full_name']} — 🏆 {champs.get(uid, '—')} | "
+            f"Grupe: {gcounts.get(uid, 0)}/{len(TEAMS)} | Meciuri: {mcounts.get(uid, 0)}"
+        )
+    lines.append("\nDetalii complete pentru cineva: /picks <id sau @user>")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Format: /picks <id sau @username> (vezi /participanti).\nPentru toți deodată: /allpicks"
+        )
+        return
+    arg = context.args[0]
+    with db() as c:
+        if arg.startswith("@"):
+            u = c.execute("SELECT user_id, full_name FROM users WHERE username=?", (arg[1:],)).fetchone()
+        elif arg.isdigit():
+            u = c.execute("SELECT user_id, full_name FROM users WHERE user_id=?", (int(arg),)).fetchone()
+        else:
+            u = None
+        if not u:
+            await update.message.reply_text("Nu am găsit persoana. Vezi /participanti.")
+            return
+        uid = u["user_id"]
+        champ = c.execute("SELECT team_name FROM champion_picks WHERE user_id=?", (uid,)).fetchone()
+        gpicks = c.execute(
+            "SELECT group_label, team_name FROM group_picks WHERE user_id=? ORDER BY group_label",
+            (uid,),
+        ).fetchall()
+        mpicks = c.execute(
+            "SELECT m.home, m.away, mp.pick "
+            "FROM match_predictions mp JOIN matches m ON m.match_id=mp.match_id "
+            "WHERE mp.user_id=? ORDER BY m.kickoff",
+            (uid,),
+        ).fetchall()
+    lines = [f"📋 Pronosticurile lui {u['full_name']}\n"]
+    lines.append(f"🏆 Campioană: {champ['team_name'] if champ else '—'}")
+    lines.append("\n📊 Grupe:")
+    lines += [f"  • Grupa {g['group_label']}: {g['team_name']}" for g in gpicks] or ["  —"]
+    lines.append("\n⚽️ Meciuri:")
+    if mpicks:
+        lines += [f"  • {mp['home']} vs {mp['away']}: {pick_label(mp['home'], mp['away'], mp['pick'])}" for mp in mpicks]
+    else:
+        lines.append("  —")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_matchpicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Format: /matchpicks <id_meci> (vezi /listmatches)")
+        return
+    mid = int(context.args[0])
+    with db() as c:
+        m = c.execute("SELECT * FROM matches WHERE match_id=?", (mid,)).fetchone()
+        if not m:
+            await update.message.reply_text("Meci inexistent.")
+            return
+        rows = c.execute(
+            "SELECT u.full_name, mp.pick FROM match_predictions mp "
+            "JOIN users u ON u.user_id=mp.user_id "
+            "WHERE mp.match_id=? AND u.approved=1 ORDER BY u.full_name",
+            (mid,),
+        ).fetchall()
+    lines = [f"⚽️ {m['home']} vs {m['away']} ({m['stage']}) — pronosticuri:\n"]
+    if not rows:
+        lines.append("Nimeni n-a pronosticat încă.")
+    else:
+        for r in rows:
+            lines.append(f"• {r['full_name']}: {pick_label(m['home'], m['away'], r['pick'])}")
+    if m["result"]:
+        lines.append(f"\nRezultat oficial: {pick_label(m['home'], m['away'], m['result'])}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ------------------------------------------------------------------ #
 #  COMENZI ADMIN — concurs
 # ------------------------------------------------------------------ #
 async def cmd_addmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1084,6 +1186,9 @@ def main():
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("deny", cmd_deny))
     app.add_handler(CommandHandler("participanti", cmd_participanti))
+    app.add_handler(CommandHandler("allpicks", cmd_allpicks))
+    app.add_handler(CommandHandler("picks", cmd_picks))
+    app.add_handler(CommandHandler("matchpicks", cmd_matchpicks))
 
     # Admin — concurs
     app.add_handler(CommandHandler("addmatch", cmd_addmatch))
