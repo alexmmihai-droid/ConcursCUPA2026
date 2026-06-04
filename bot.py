@@ -114,6 +114,9 @@ def db():
 
 
 def init_db():
+    # asigură că folderul bazei de date există (ex. /data de pe volum)
+    d = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(d, exist_ok=True)
     with db() as c:
         c.executescript(
             """
