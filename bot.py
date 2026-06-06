@@ -389,6 +389,21 @@ def db_one(query, params=()):
 
 
 def init_db():
+    # Config table prima, ca să putem reseta flag-ul de seed dacă reparăm schema.
+    db_run("""CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT)""")
+
+    # AUTO-REPARARE: dacă pe Volume a rămas un tabel "matches" vechi (de la botul anterior)
+    # cu altă structură, îl recreăm curat — altfel crapă la pornire ("no column named grp").
+    info = db_all("PRAGMA table_info(matches)")
+    if info:
+        cols = {row["name"] for row in info}
+        expected = {"id", "stage", "grp", "home", "away", "kickoff", "venue",
+                    "teams_known", "note", "result_home", "result_away", "finished"}
+        if not expected.issubset(cols):
+            log.warning("Tabel 'matches' vechi/incompatibil pe Volume — îl recreez curat.")
+            db_run("DROP TABLE matches")
+            db_run("DELETE FROM config WHERE key='seeded'")
+
     db_run("""CREATE TABLE IF NOT EXISTS users(
         telegram_id INTEGER PRIMARY KEY,
         username TEXT, full_name TEXT,
@@ -408,7 +423,6 @@ def init_db():
     db_run("""CREATE TABLE IF NOT EXISTS bonus(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER, points REAL, reason TEXT, created_at TEXT)""")
-    db_run("""CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT)""")
 
     if get_config("seeded") != "1":
         for m in SEED_MATCHES:
