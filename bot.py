@@ -388,26 +388,25 @@ def db_one(query, params=()):
         return _conn.execute(query, params).fetchone()
 
 
+SCHEMA_VERSION = "2"   # crește numărul dacă schimbi structura tabelelor
+
+
 def init_db():
-    # Config table prima (o folosim pentru flag-uri).
+    # config table — reparat dacă a rămas incompatibil de la alt bot
+    info = db_all("PRAGMA table_info(config)")
+    if info and not {"key", "value"}.issubset({r["name"] for r in info}):
+        db_run("DROP TABLE config")
     db_run("""CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT)""")
 
-    # AUTO-REPARARE: pe Volume pot rămâne tabele vechi de la botul anterior, cu altă
-    # structură. Le recreăm curat ca să nu crape comenzile ("no column named ...").
-    EXPECTED = {
-        "users": {"telegram_id", "username", "full_name", "approved", "joined_at"},
-        "global_predictions": {"telegram_id", "kind", "value"},
-        "matches": {"id", "stage", "grp", "home", "away", "kickoff", "venue",
-                    "teams_known", "note", "result_home", "result_away", "finished"},
-        "match_predictions": {"telegram_id", "match_id", "pick"},
-        "results": {"kind", "value"},
-        "bonus": {"id", "telegram_id", "points", "reason", "created_at"},
-    }
-    for tname, expected in EXPECTED.items():
-        info = db_all(f"PRAGMA table_info({tname})")
-        if info and not expected.issubset({r["name"] for r in info}):
-            log.warning("Tabel '%s' vechi/incompatibil pe Volume — îl recreez curat.", tname)
-            db_run(f"DROP TABLE {tname}")
+    # Dacă baza de date de pe Volume nu e a botului ăstuia (rămasă de la botul vechi)
+    # sau lipsește marcajul de versiune, ștergem TOATE tabelele și le refacem curat.
+    # La un restart normal versiunea se potrivește și NU se șterge nimic (datele rămân).
+    if get_config("schema_version") != SCHEMA_VERSION:
+        log.warning("Schemă veche/incompatibilă pe Volume — recreez baza de date curat.")
+        for t in ("users", "global_predictions", "matches",
+                  "match_predictions", "results", "bonus"):
+            db_run(f"DROP TABLE IF EXISTS {t}")
+        set_config("schema_version", SCHEMA_VERSION)
 
     db_run("""CREATE TABLE IF NOT EXISTS users(
         telegram_id INTEGER PRIMARY KEY,
@@ -429,7 +428,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER, points REAL, reason TEXT, created_at TEXT)""")
 
-    # Seed meciuri dacă tabelul e gol (sigur și după o reparare).
+    # Seed meciuri dacă tabelul e gol.
     if db_one("SELECT COUNT(*) c FROM matches")["c"] == 0:
         for m in SEED_MATCHES:
             db_run("""INSERT INTO matches(stage,grp,home,away,kickoff,venue,teams_known,note)
@@ -1560,7 +1559,7 @@ async def daily_post(context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 
 async def on_error(update, context):
-    log.error("Eroare: %s", context.error)
+    log.error("Eroare la procesare:", exc_info=context.error)
 
 
 # ==============================================================================
