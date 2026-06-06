@@ -1,1216 +1,1606 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-=====================================================================
-  BOT TELEGRAM — CONCURS CUPA MONDIALĂ 2026
-=====================================================================
+================================================================================
+  CONCURS CUPA MONDIALĂ 2026 — BOT TELEGRAM
+================================================================================
 
 PUNCTAJ:
-  • Campioana turneului ghicită ........ 5 puncte
-  • Câștigătoarea unei grupe ghicită .... 2 puncte (x12 grupe)
-  • Meci ghicit (1 / X / 2) ............. 3 puncte
+  • Campioana mondială ......... 5p
+  • Câștigătoarea unei grupe ... 2p
+  • Rezultat meci (1 X 2) ...... 3p
+  • Scor exact ................. +2p (peste cele 3 de la 1X2)
+  • Golgheterul turneului ...... 4p
 
-ACCES:
-  • Fiecare participant dă /start și intră ÎN AȘTEPTARE.
-  • Tu (admin) primești o notificare și îl aprobi cu /approve după
-    ce ai încasat cotizația. Doar cei aprobați joacă și apar în clasament.
+--------------------------------------------------------------------------------
+  CUM ÎL PORNEȘTI (o singură dată)
+--------------------------------------------------------------------------------
+  1. Instalează Python 3.10+ și librăria:
+         pip install "python-telegram-bot[job-queue]==21.6"
 
-FLUX PARTICIPANT (aprobat):
-  /campioana  -> alege campioana turneului
-  /grupe      -> alege câștigătoarea fiecărei grupe
-  -> în fiecare zi primește, automat, MECIURILE DE MÂINE (cu ~24h înainte)
-  -> pronostichează la fiecare meci până la ora de start
-  -> seara primește clasamentul
+  2. Creează botul la @BotFather pe Telegram și ia TOKEN-ul.
 
-PREMII (din cotizație, gestionate de tine, cash):
-  Locul 1 = 50% + tricou  |  Locul 2 = 30%  |  Locul 3 = 20%
+  3. Află ID-ul tău de Telegram: pornește botul, scrie-i /id în privat.
+     Pune numărul la ADMIN_IDS mai jos.
 
----------------------------------------------------------------------
-RESETARE (admin):
-  /reset_game CONFIRM  -> șterge pronosticurile și rezultatele,
-                          PĂSTREAZĂ jucătorii, meciurile și setările
-  /reset_all  CONFIRM  -> șterge TOT (inclusiv jucătorii) și reîncarcă
-                          echipele implicite (resetare de fabrică)
+  4. Bagă TOKEN-ul la BOT_TOKEN mai jos.
 
-CONFIGURARE (variabile de mediu):
-  BOT_TOKEN, ADMIN_IDS, TZ, DAILY_MATCHES_HOUR,
-  LEADERBOARD_HOUR, LEADERBOARD_MINUTE, DB_PATH
-=====================================================================
+  5. Pornește botul:
+         python worldcup_bot.py
+
+  6. Adaugă botul în grupul tău, dă-i drept de admin (ca să vadă membrii noi),
+     apoi scrie /setgrup CHIAR ÎN GRUP. De acolo postează automat la 12:00.
+
+--------------------------------------------------------------------------------
+  CUM SE JOACĂ (participanții)
+--------------------------------------------------------------------------------
+  - Intră în grup -> botul le spune să-ți scrie în privat -> tu îi aprobi.
+  - După aprobare aleg, în ordine (NU se mai pot schimba):
+        1) Campioana   2) Golgheterul   3) Câștig. Grupa A   4) Câștig. Grupa B
+  - Restul grupelor le deschizi tu mai târziu cu /deschide_grupa C, D, ...
+  - Pentru meciuri: /azi și /maine. Pronosticul se poate schimba până începe meciul.
+
+--------------------------------------------------------------------------------
+  COMENZI ADMIN (scrie-le în privat botului)
+--------------------------------------------------------------------------------
+  APROBARE
+    /aproba <id>            aprobă un participant (sau folosește butoanele)
+    /resping <id>           respinge / scoate un participant
+    /useri                  lista participanților cu ID și status
+
+  REZULTATE (de aici dai punctele)
+    /scor <id_meci> 2-1     pune rezultatul unui meci (merge și 2:1 sau 2 1)
+    /anuleaza_scor <id>     șterge rezultatul unui meci
+    /grupa A Mexic          cine a câștigat grupa A (pentru cele 2p)
+    /campioana Spania       campioana mondială (pentru cele 5p)
+    /golgheter Mbappe       golgheterul turneului (4p). 'ALTUL' dacă nu e în listă
+
+  MECIURI
+    /lista                  toate meciurile cu ID, oră, rezultat (referință rapidă)
+    /echipe <id> Brazilia - Spania   pune echipele la un meci din faza eliminatorie
+    /ora <id> 2026-07-09 23:00       schimbă ora unui meci
+    /amical Italia | Brazilia | 2026-06-06 21:00   adaugă rapid un amical
+    /adauga_meci grupe | A | Mexic | Cehia | 2026-06-11 22:00 | Mexico   (avansat)
+    /sterge_meci <id>       șterge un meci
+
+  ALTELE
+    /deschide_grupa C       deschide o nouă grupă la vot pentru toți
+    /bonus <id sau @user> 3 motiv   adaugă (sau scade, cu -3) puncte manual
+    /premii_set <text>      setează textul de la /premii
+    /anunt <text>           trimite un mesaj tuturor participanților
+
+  RESETARE (NU scoate oamenii din concurs)
+    /reset_pronosticuri     șterge toate pronosticurile pe meciuri ale tuturor
+    /reset_rezultate        șterge toate rezultatele (meciuri + campioană/grupe...)
+    /reset_tot              șterge TOT (pronosticuri + rezultate + bonus), DAR
+                            păstrează participanții (nu mai intră din nou în grup)
+
+================================================================================
 """
 
-import os
 import logging
+import os
 import sqlite3
-import contextlib
-from datetime import datetime, time as dtime, timedelta
+import threading
+import unicodedata
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
-# ------------------------------------------------------------------ #
-#  CONFIGURARE
-# ------------------------------------------------------------------ #
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_IDS = {
-    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x
-}
-TZ = ZoneInfo(os.environ.get("TZ", "Europe/Bucharest"))
-DB_PATH = os.environ.get("DB_PATH", "contest.db")
-DAILY_HOUR = int(os.environ.get("DAILY_MATCHES_HOUR", "9"))
-LB_HOUR = int(os.environ.get("LEADERBOARD_HOUR", "23"))
-LB_MIN = int(os.environ.get("LEADERBOARD_MINUTE", "30"))
+# ==============================================================================
+#  >>>>>>>>>>>>>>>>>>>>>>  MODIFICĂ AICI  <<<<<<<<<<<<<<<<<<<<<<<<
+# ==============================================================================
 
-POINTS_MATCH = 3
-POINTS_GROUP = 2
-POINTS_CHAMPION = 5
+# Pe RAILWAY pune astea ca "Variables" (NU le scrie în cod — altfel token-ul ajunge pe GitHub):
+#   BOT_TOKEN        = token-ul de la @BotFather
+#   ADMIN_IDS        = ID-ul tău (mai multe, separate prin virgulă: 111,222)
+#   RAILWAY_RUN_UID  = 0     (OBLIGATORIU ca să meargă Volume-ul, altfel datele tot se șterg)
+# Dacă atașezi un Volume, baza de date se salvează automat pe el și persistă între deploy-uri.
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUNE_TOKENUL_AICI")
+
+ADMIN_IDS = set()
+for _x in os.environ.get("ADMIN_IDS", "123456789").replace(" ", "").split(","):
+    try:
+        ADMIN_IDS.add(int(_x))
+    except ValueError:
+        pass
+
+TIMEZONE = os.environ.get("TIMEZONE", "Europe/Bucharest")
+DAILY_HOUR = int(os.environ.get("DAILY_HOUR", "12"))      # ora postării zilnice
+DAILY_MINUTE = int(os.environ.get("DAILY_MINUTE", "0"))
+
+# Baza de date: dacă există un Volume Railway, o punem AUTOMAT pe el (date persistente).
+_vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+DB_PATH = os.environ.get("DB_PATH") or (
+    f"{_vol.rstrip('/')}/worldcup.db" if _vol else "worldcup.db")
+
+# ==============================================================================
+
+TZ = ZoneInfo(TIMEZONE)
 
 logging.basicConfig(
-    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO
 )
-log = logging.getLogger("cupa-bot")
+log = logging.getLogger("wc-bot")
 
-# ------------------------------------------------------------------ #
-#  ECHIPELE ȘI GRUPELE — Cupa Mondială 2026
-# ------------------------------------------------------------------ #
-TEAMS = {
-    "A": ["Cehia", "Mexic", "Africa de Sud", "Coreea de Sud"],
-    "B": ["Elveția", "Bosnia și Herțegovina", "Canada", "Qatar"],
-    "C": ["Scoția", "Brazilia", "Haiti", "Maroc"],
-    "D": ["Turcia", "Paraguay", "SUA", "Australia"],
-    "E": ["Germania", "Ecuador", "Coasta de Fildeș", "Curacao"],
-    "F": ["Suedia", "Țările de Jos", "Tunisia", "Japonia"],
+
+# ==============================================================================
+#  DATELE TURNEULUI
+# ==============================================================================
+
+GROUPS = {
+    "A": ["Mexic", "Africa de Sud", "Coreea de Sud", "Cehia"],
+    "B": ["Canada", "Bosnia", "Qatar", "Elveția"],
+    "C": ["Brazilia", "Maroc", "Haiti", "Scoția"],
+    "D": ["SUA", "Paraguay", "Australia", "Turcia"],
+    "E": ["Germania", "Curaçao", "Coasta de Fildeș", "Ecuador"],
+    "F": ["Olanda", "Japonia", "Suedia", "Tunisia"],
     "G": ["Belgia", "Egipt", "Iran", "Noua Zeelandă"],
-    "H": ["Spania", "Uruguay", "Capul Verde", "Arabia Saudită"],
-    "I": ["Franța", "Norvegia", "Senegal", "Irak"],
-    "J": ["Austria", "Argentina", "Algeria", "Iordania"],
-    "K": ["Portugalia", "Columbia", "DR Congo", "Uzbekistan"],
-    "L": ["Croația", "Anglia", "Ghana", "Panama"],
+    "H": ["Spania", "Capul Verde", "Arabia Saudită", "Uruguay"],
+    "I": ["Franța", "Senegal", "Irak", "Norvegia"],
+    "J": ["Argentina", "Algeria", "Austria", "Iordania"],
+    "K": ["Portugalia", "DR Congo", "Uzbekistan", "Columbia"],
+    "L": ["Anglia", "Croația", "Ghana", "Panama"],
 }
+ALL_TEAMS = sorted({t for teams in GROUPS.values() for t in teams})
 
-# ------------------------------------------------------------------ #
+# Golgheteri: (nume, cotă). Cei cu cotă <= 40 apar ca butoane rapide; restul prin căutare.
+TOPSCORERS = [
+    ("Kylian Mbappe", 7), ("Harry Kane", 8), ("Lionel Messi", 13),
+    ("Erling Haaland", 15), ("Lamine Yamal", 15),
+    ("Cristiano Ronaldo", 20), ("Mikel Oyarzabal", 20), ("Ousmane Dembele", 20),
+    ("Lautaro Martinez", 25), ("Vinicius Jr.", 25), ("Kai Havertz", 30),
+    ("Bukayo Saka", 35), ("Mikel Merino", 35), ("Nick Woltemade", 35),
+    ("Raphinha", 35), ("Romelu Lukaku", 35),
+    ("Bruno Fernandes", 40), ("Cody Gakpo", 40), ("Florian Wirtz", 40),
+    ("Jude Bellingham", 40), ("Julian Alvarez", 40), ("Michael Olise", 40),
+    ("Neymar Jr", 40),
+    ("Dani Olmo", 50), ("Desire Doue", 50), ("Ferran Torres", 50),
+    ("Goncalo Ramos", 50), ("Jean-Philippe Mateta", 50), ("Leandro Trossard", 50),
+    ("Luis Diaz", 50), ("Marcus Rashford", 50), ("Memphis Depay", 50),
+    ("Mohamed Salah", 50), ("Morgan Rogers", 50), ("Nico Williams", 50),
+    ("Serge Gnabry", 50),
+    ("Igor Thiago", 70),
+    ("Alexander Sorloth", 75), ("Anthony Gordon", 75), ("Bradley Barcola", 75),
+    ("Christian Pulisic", 75), ("Darwin Nunez", 75), ("Donyell Malen", 75),
+    ("Eberechi Eze", 75),
+    ("Deniz Undav", 80), ("Endrick", 80), ("Jeremy Doku", 80), ("Jhon Duran", 80),
+    ("Kevin de Bruyne", 80), ("Kingsley Coman", 80), ("Leroy Sane", 80),
+    ("Lois Openda", 80), ("Pedro Neto", 80), ("Rafael Leao", 80),
+    ("Randal Muani", 80), ("Sadio Mane", 80), ("Viktor Gyokeres", 80),
+    ("Armando Gonzalez", 100), ("Edin Dzeko", 100), ("Folarin Balogun", 100),
+    ("Gabriel Martinelli", 100), ("Haji Wright", 100), ("James Rodriguez", 100),
+    ("Jonathan David", 100), ("Kerem Akturkoglu", 100), ("Matheus Cunha", 100),
+    ("Nicolas Jackson", 100), ("Noa Lang", 100), ("Omar Marmoush", 100),
+    ("Pedri", 100), ("Promise David", 100), ("Raul Gimenez", 100),
+    ("Ricardo Pepi", 100), ("Xavi Simons", 100),
+    ("Arda Guler", 125), ("Ayase Ueda", 125), ("Baris Yilmaz", 125),
+    ("Breel Embolo", 125), ("Ermedin Demirovic", 125), ("Heung-Min Son", 125),
+    ("Kenan Yildiz", 125),
+    ("Alphonso Davies", 150), ("Andrej Kramaric", 150), ("Anthony Elanga", 150),
+    ("Antonio Nusa", 150), ("Ayoub El Kaabi", 150), ("Brian Rodriguez", 150),
+    ("Cyle Larin", 150), ("Daizen Maeda", 150), ("Enzo Fernandez", 150),
+    ("Granit Xhaka", 150), ("Hamza Igamane", 150), ("Hirving Lozano", 150),
+    ("Jhon Arias", 150), ("Jorgen Larsen", 150), ("Kang-In Lee", 150),
+    ("Orbelin Pineda", 150), ("Oscar Bobb", 150), ("Patrik Schick", 150),
+    ("Riyad Mahrez", 150), ("Scott McTominay", 150), ("Tomas Chory", 150),
+    ("Youssef En Nesyri", 150),
+    ("Cedric Bakambu", 200), ("Chris Wood", 200), ("Facundo Pellistri", 200),
+    ("Giovanni Reyna", 200), ("Hee-Chan Hwang", 200), ("Ismaila Sarr", 200),
+    ("Martin Odegaard", 200), ("Nikola Vlasic", 200), ("Pavel Sulc", 200),
+    ("Takumi Minamino", 200),
+    ("Che Adams", 250), ("Declan Rice", 250), ("Saleh Al Shehri", 250),
+    ("Salem Al Dawsari", 250), ("Yoane Wissa", 250),
+    ("Daichi Kamada", 350), ("Julio Enciso", 350), ("Lyndon Dykes", 350),
+    ("Ryan Christie", 350),
+    ("Brenden Aaronson", 500), ("Eldor Shomurodov", 500), ("John McGinn", 500),
+    ("Lyle Foster", 500), ("Martin Boyle", 500), ("Nestory Irankunda", 500),
+    ("Ben Waine", 750),
+]
+TS_NAMES = [n for n, _ in TOPSCORERS]
+TS_FAVORITES = [(n, c) for n, c in TOPSCORERS if c <= 40]
+
+# Meciuri inițiale: (stage, grupa, gazda, oaspete, "YYYY-MM-DD HH:MM", loc, teams_known, nota)
+# teams_known = 0 înseamnă că echipele sunt necunoscute (faza eliminatorie) -> le pui tu cu /echipe
+SEED_MATCHES = [
+    # ---------------- AMICALE TEST (azi) — ca să verifici că merge tot ----------------
+    ("amical", None, "România", "Rep. Moldova", "2026-06-06 20:00", "Amical", 1, "AMICAL TEST"),
+    ("amical", None, "Italia", "Argentina", "2026-06-06 23:00", "Amical", 1, "AMICAL TEST"),
+    ("amical", None, "Spania", "Portugalia", "2026-06-07 21:00", "Amical", 1, "AMICAL TEST"),
+
+    # ---------------- ETAPA 1 ----------------
+    ("grupe", "A", "Mexic", "Africa de Sud", "2026-06-11 22:00", "Mexico City", 1, "Etapa 1"),
+    ("grupe", "A", "Coreea de Sud", "Cehia", "2026-06-12 05:00", "Guadalajara", 1, "Etapa 1"),
+    ("grupe", "B", "Canada", "Bosnia", "2026-06-12 22:00", "Toronto", 1, "Etapa 1"),
+    ("grupe", "D", "SUA", "Paraguay", "2026-06-13 04:00", "Los Angeles", 1, "Etapa 1"),
+    ("grupe", "B", "Qatar", "Elveția", "2026-06-13 22:00", "San Francisco", 1, "Etapa 1"),
+    ("grupe", "C", "Brazilia", "Maroc", "2026-06-14 01:00", "New Jersey", 1, "Etapa 1"),
+    ("grupe", "C", "Haiti", "Scoția", "2026-06-14 04:00", "Boston", 1, "Etapa 1"),
+    ("grupe", "D", "Australia", "Turcia", "2026-06-14 07:00", "Vancouver", 1, "Etapa 1"),
+    ("grupe", "E", "Germania", "Curaçao", "2026-06-14 20:00", "Houston", 1, "Etapa 1"),
+    ("grupe", "F", "Olanda", "Japonia", "2026-06-14 23:00", "Dallas", 1, "Etapa 1"),
+    ("grupe", "E", "Coasta de Fildeș", "Ecuador", "2026-06-15 02:00", "Philadelphia", 1, "Etapa 1"),
+    ("grupe", "F", "Suedia", "Tunisia", "2026-06-15 05:00", "Monterrey", 1, "Etapa 1"),
+    ("grupe", "H", "Spania", "Capul Verde", "2026-06-15 19:00", "Atlanta", 1, "Etapa 1"),
+    ("grupe", "G", "Belgia", "Egipt", "2026-06-15 22:00", "Seattle", 1, "Etapa 1"),
+    ("grupe", "H", "Arabia Saudită", "Uruguay", "2026-06-16 01:00", "Miami", 1, "Etapa 1"),
+    ("grupe", "G", "Iran", "Noua Zeelandă", "2026-06-16 04:00", "Los Angeles", 1, "Etapa 1"),
+    ("grupe", "I", "Franța", "Senegal", "2026-06-16 22:00", "New Jersey", 1, "Etapa 1"),
+    ("grupe", "I", "Irak", "Norvegia", "2026-06-17 01:00", "Boston", 1, "Etapa 1"),
+    ("grupe", "J", "Argentina", "Algeria", "2026-06-17 04:00", "Kansas City", 1, "Etapa 1"),
+    ("grupe", "J", "Austria", "Iordania", "2026-06-17 07:00", "San Francisco", 1, "Etapa 1"),
+    ("grupe", "K", "Portugalia", "DR Congo", "2026-06-17 20:00", "Houston", 1, "Etapa 1"),
+    ("grupe", "L", "Anglia", "Croația", "2026-06-17 23:00", "Dallas", 1, "Etapa 1"),
+    ("grupe", "L", "Ghana", "Panama", "2026-06-18 02:00", "Toronto", 1, "Etapa 1"),
+    ("grupe", "K", "Uzbekistan", "Columbia", "2026-06-18 05:00", "Mexico City", 1, "Etapa 1"),
+
+    # ---------------- ETAPA 2 ----------------
+    ("grupe", "A", "Cehia", "Africa de Sud", "2026-06-18 19:00", "Atlanta", 1, "Etapa 2"),
+    ("grupe", "B", "Elveția", "Bosnia", "2026-06-18 22:00", "Los Angeles", 1, "Etapa 2"),
+    ("grupe", "B", "Canada", "Qatar", "2026-06-19 01:00", "Vancouver", 1, "Etapa 2"),
+    ("grupe", "A", "Mexic", "Coreea de Sud", "2026-06-19 04:00", "Guadalajara", 1, "Etapa 2"),
+    ("grupe", "D", "SUA", "Australia", "2026-06-19 22:00", "Seattle", 1, "Etapa 2"),
+    ("grupe", "C", "Scoția", "Maroc", "2026-06-20 01:00", "Boston", 1, "Etapa 2"),
+    ("grupe", "C", "Brazilia", "Haiti", "2026-06-20 04:00", "Philadelphia", 1, "Etapa 2"),
+    ("grupe", "D", "Turcia", "Paraguay", "2026-06-20 07:00", "San Francisco", 1, "Etapa 2"),
+    ("grupe", "F", "Olanda", "Suedia", "2026-06-20 20:00", "Houston", 1, "Etapa 2"),
+    ("grupe", "E", "Germania", "Coasta de Fildeș", "2026-06-20 23:00", "Toronto", 1, "Etapa 2"),
+    ("grupe", "E", "Ecuador", "Curaçao", "2026-06-21 03:00", "Kansas City", 1, "Etapa 2"),
+    ("grupe", "F", "Tunisia", "Japonia", "2026-06-21 07:00", "Monterrey", 1, "Etapa 2"),
+    ("grupe", "H", "Spania", "Arabia Saudită", "2026-06-21 19:00", "Atlanta", 1, "Etapa 2"),
+    ("grupe", "G", "Belgia", "Iran", "2026-06-21 22:00", "Los Angeles", 1, "Etapa 2"),
+    ("grupe", "H", "Uruguay", "Capul Verde", "2026-06-22 01:00", "Miami", 1, "Etapa 2"),
+    ("grupe", "G", "Noua Zeelandă", "Egipt", "2026-06-22 04:00", "Vancouver", 1, "Etapa 2"),
+    ("grupe", "J", "Argentina", "Austria", "2026-06-22 20:00", "Dallas", 1, "Etapa 2"),
+    ("grupe", "I", "Franța", "Irak", "2026-06-23 00:00", "Philadelphia", 1, "Etapa 2"),
+    ("grupe", "I", "Norvegia", "Senegal", "2026-06-23 03:00", "Toronto", 1, "Etapa 2"),
+    ("grupe", "J", "Iordania", "Algeria", "2026-06-23 06:00", "San Francisco", 1, "Etapa 2"),
+    ("grupe", "K", "Portugalia", "Uzbekistan", "2026-06-23 20:00", "Houston", 1, "Etapa 2"),
+    ("grupe", "L", "Anglia", "Ghana", "2026-06-23 23:00", "Boston", 1, "Etapa 2"),
+    ("grupe", "L", "Panama", "Croația", "2026-06-24 02:00", "Boston", 1, "Etapa 2"),
+    ("grupe", "K", "Columbia", "DR Congo", "2026-06-24 05:00", "Guadalajara", 1, "Etapa 2"),
+
+    # ---------------- ETAPA 3 ----------------
+    ("grupe", "B", "Elveția", "Canada", "2026-06-24 22:00", "Vancouver", 1, "Etapa 3"),
+    ("grupe", "B", "Bosnia", "Qatar", "2026-06-24 22:00", "Seattle", 1, "Etapa 3"),
+    ("grupe", "C", "Maroc", "Haiti", "2026-06-25 01:00", "Atlanta", 1, "Etapa 3"),
+    ("grupe", "C", "Scoția", "Brazilia", "2026-06-25 01:00", "Miami", 1, "Etapa 3"),
+    ("grupe", "A", "Cehia", "Mexic", "2026-06-25 04:00", "Mexico City", 1, "Etapa 3"),
+    ("grupe", "A", "Africa de Sud", "Coreea de Sud", "2026-06-25 04:00", "Monterrey", 1, "Etapa 3"),
+    ("grupe", "E", "Curaçao", "Coasta de Fildeș", "2026-06-25 23:00", "Philadelphia", 1, "Etapa 3"),
+    ("grupe", "E", "Ecuador", "Germania", "2026-06-25 23:00", "New Jersey", 1, "Etapa 3"),
+    ("grupe", "F", "Japonia", "Suedia", "2026-06-26 02:00", "Dallas", 1, "Etapa 3"),
+    ("grupe", "F", "Tunisia", "Olanda", "2026-06-26 02:00", "Kansas City", 1, "Etapa 3"),
+    ("grupe", "D", "Turcia", "SUA", "2026-06-26 05:00", "Los Angeles", 1, "Etapa 3"),
+    ("grupe", "D", "Paraguay", "Australia", "2026-06-26 05:00", "San Francisco", 1, "Etapa 3"),
+    ("grupe", "I", "Norvegia", "Franța", "2026-06-26 22:00", "Boston", 1, "Etapa 3"),
+    ("grupe", "I", "Senegal", "Irak", "2026-06-26 22:00", "Toronto", 1, "Etapa 3"),
+    ("grupe", "H", "Capul Verde", "Arabia Saudită", "2026-06-27 03:00", "Houston", 1, "Etapa 3"),
+    ("grupe", "H", "Uruguay", "Spania", "2026-06-27 03:00", "Guadalajara", 1, "Etapa 3"),
+    ("grupe", "G", "Noua Zeelandă", "Belgia", "2026-06-27 06:00", "Vancouver", 1, "Etapa 3"),
+    ("grupe", "G", "Egipt", "Iran", "2026-06-27 06:00", "Seattle", 1, "Etapa 3"),
+    ("grupe", "L", "Panama", "Anglia", "2026-06-28 00:00", "New Jersey", 1, "Etapa 3"),
+    ("grupe", "L", "Croația", "Ghana", "2026-06-28 00:00", "Philadelphia", 1, "Etapa 3"),
+    ("grupe", "K", "Columbia", "Portugalia", "2026-06-28 02:30", "Miami", 1, "Etapa 3"),
+    ("grupe", "K", "DR Congo", "Uzbekistan", "2026-06-28 02:30", "Atlanta", 1, "Etapa 3"),
+    ("grupe", "J", "Algeria", "Austria", "2026-06-28 05:00", "Kansas City", 1, "Etapa 3"),
+    ("grupe", "J", "Iordania", "Argentina", "2026-06-28 05:00", "Dallas", 1, "Etapa 3"),
+
+    # ---------------- 16-imi (echipele se pun cu /echipe) ----------------
+    ("r32", None, "Locul 2 Gr. A", "Locul 2 Gr. B", "2026-06-28 22:00", "Los Angeles", 0, "M73"),
+    ("r32", None, "Câștig. Gr. C", "Locul 2 Gr. F", "2026-06-29 20:00", "Houston", 0, "M76"),
+    ("r32", None, "Câștig. Gr. E", "Cel mai bun loc 3", "2026-06-29 23:30", "Boston", 0, "M74"),
+    ("r32", None, "Câștig. Gr. F", "Locul 2 Gr. C", "2026-06-30 04:00", "Monterrey", 0, "M75"),
+    ("r32", None, "Câștig. Gr. E", "Câștig. Gr. I", "2026-06-30 20:00", "Dallas", 0, "M78"),
+    ("r32", None, "Câștig. Gr. I", "Cel mai bun loc 3", "2026-07-01 00:00", "New York", 0, "M77"),
+    ("r32", None, "Câștig. Gr. A", "Cel mai bun loc 3", "2026-07-01 04:00", "Mexico City", 0, "M79"),
+    ("r32", None, "Câștig. Gr. L", "Cel mai bun loc 3", "2026-07-01 19:00", "Atlanta", 0, "M80"),
+    ("r32", None, "Câștig. Gr. G", "Cel mai bun loc 3", "2026-07-01 23:00", "Seattle", 0, "M82"),
+    ("r32", None, "Câștig. Gr. D", "Cel mai bun loc 3", "2026-07-02 03:00", "San Francisco", 0, "M81"),
+    ("r32", None, "Câștig. Gr. H", "Locul 2 Gr. J", "2026-07-02 04:00", "Los Angeles", 0, "M84"),
+    ("r32", None, "Locul 2 Gr. K", "Locul 2 Gr. L", "2026-07-03 02:00", "Toronto", 0, "M83"),
+    ("r32", None, "Câștig. Gr. B", "Cel mai bun loc 3", "2026-07-03 06:00", "Vancouver", 0, "M85"),
+    ("r32", None, "Câștig. Gr. J", "Locul 2 Gr. H", "2026-07-03 21:00", "Dallas", 0, "M88"),
+    ("r32", None, "Locul 2 Gr. D", "Locul 2 Gr. G", "2026-07-04 01:00", "Miami", 0, "M86"),
+    ("r32", None, "Câștig. Gr. K", "Cel mai bun loc 3", "2026-07-04 04:30", "Vancouver", 0, "M87"),
+
+    # ---------------- Optimi ----------------
+    ("r16", None, "Câștig. M73", "Câștig. M75", "2026-07-04 20:00", "Houston", 0, "Optimi (M90)"),
+    ("r16", None, "Câștig. M74", "Câștig. M77", "2026-07-05 00:00", "Philadelphia", 0, "Optimi (M89)"),
+    ("r16", None, "Câștig. M76", "Câștig. M78", "2026-07-05 01:00", "New York", 0, "Optimi (M91)"),
+    ("r16", None, "Câștig. M79", "Câștig. M80", "2026-07-06 03:00", "Mexico City", 0, "Optimi (M92)"),
+    ("r16", None, "Câștig. M83", "Câștig. M84", "2026-07-06 22:00", "Dallas", 0, "Optimi (M93)"),
+    ("r16", None, "Câștig. M81", "Câștig. M82", "2026-07-07 03:00", "Seattle", 0, "Optimi (M94)"),
+    ("r16", None, "Câștig. M86", "Câștig. M88", "2026-07-07 19:00", "Atlanta", 0, "Optimi (M95)"),
+    ("r16", None, "Câștig. M85", "Câștig. M87", "2026-07-07 23:00", "Vancouver", 0, "Optimi (M96)"),
+
+    # ---------------- Sferturi ----------------
+    ("sferturi", None, "Câștig. Optimi 1", "Câștig. Optimi 2", "2026-07-09 23:00", "Boston", 0, "Sfert 1"),
+    ("sferturi", None, "Câștig. Optimi 3", "Câștig. Optimi 4", "2026-07-10 22:00", "Los Angeles", 0, "Sfert 2"),
+    ("sferturi", None, "Câștig. Optimi 5", "Câștig. Optimi 6", "2026-07-12 00:00", "Miami", 0, "Sfert 3"),
+    ("sferturi", None, "Câștig. Optimi 7", "Câștig. Optimi 8", "2026-07-12 04:00", "Kansas City", 0, "Sfert 4"),
+
+    # ---------------- Semifinale ----------------
+    ("semifinale", None, "Câștig. Sfert 1", "Câștig. Sfert 2", "2026-07-14 22:00", "Dallas", 0, "Semifinala 1"),
+    ("semifinale", None, "Câștig. Sfert 3", "Câștig. Sfert 4", "2026-07-15 22:00", "Atlanta", 0, "Semifinala 2"),
+
+    # ---------------- Finala mică & Finala ----------------
+    ("finala_mica", None, "Învins SF1", "Învins SF2", "2026-07-19 00:00", "Miami", 0, "Finala mică"),
+    ("finala", None, "Câștig. SF1", "Câștig. SF2", "2026-07-19 22:00", "New York", 0, "FINALA"),
+]
+
+# Butoane de scor pentru un meci (1X2 + scoruri uzuale + alt scor)
+SCORE_ROWS = [
+    ["1", "X", "2"],
+    ["0-0", "1-0", "0-1"],
+    ["1-1", "2-1", "1-2"],
+    ["2-2", "2-0", "0-2"],
+    ["3-3", "3-2", "2-3"],
+    ["3-0", "0-3", "3-1"],
+    ["1-3", "✏️ Alt scor"],
+]
+
+POINTS_TEXT = (
+    "📊 Punctaj:\n"
+    "• Campioana mondială — 5p\n"
+    "• Câștigătoarea unei grupe — 2p\n"
+    "• Rezultat meci (1 X 2) — 3p\n"
+    "• Scor exact — +2p (bonus)\n"
+    "• Golgheterul turneului — 4p"
+)
+
+
+# ==============================================================================
 #  BAZA DE DATE
-# ------------------------------------------------------------------ #
-@contextlib.contextmanager
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+# ==============================================================================
+
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+_conn.row_factory = sqlite3.Row
+_lock = threading.Lock()
+
+
+def db_run(query, params=()):
+    with _lock:
+        cur = _conn.execute(query, params)
+        _conn.commit()
+        return cur
+
+
+def db_all(query, params=()):
+    with _lock:
+        return _conn.execute(query, params).fetchall()
+
+
+def db_one(query, params=()):
+    with _lock:
+        return _conn.execute(query, params).fetchone()
 
 
 def init_db():
-    # asigură că folderul bazei de date există (ex. /data de pe volum)
-    d = os.path.dirname(os.path.abspath(DB_PATH))
-    os.makedirs(d, exist_ok=True)
-    with db() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                user_id   INTEGER PRIMARY KEY,
-                username  TEXT,
-                full_name TEXT,
-                approved  INTEGER DEFAULT 0,
-                joined_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS teams(
-                team_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT UNIQUE,
-                group_label TEXT
-            );
-            CREATE TABLE IF NOT EXISTS matches(
-                match_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                home     TEXT,
-                away     TEXT,
-                kickoff  TEXT,
-                stage    TEXT,
-                result   TEXT
-            );
-            CREATE TABLE IF NOT EXISTS match_predictions(
-                user_id    INTEGER,
-                match_id   INTEGER,
-                pick       TEXT,
-                created_at TEXT,
-                PRIMARY KEY(user_id, match_id)
-            );
-            CREATE TABLE IF NOT EXISTS group_picks(
-                user_id     INTEGER,
-                group_label TEXT,
-                team_name   TEXT,
-                PRIMARY KEY(user_id, group_label)
-            );
-            CREATE TABLE IF NOT EXISTS champion_picks(
-                user_id   INTEGER PRIMARY KEY,
-                team_name TEXT
-            );
-            CREATE TABLE IF NOT EXISTS group_results(
-                group_label TEXT PRIMARY KEY,
-                winner_team TEXT
-            );
-            CREATE TABLE IF NOT EXISTS config(
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-            """
-        )
-        # migrare: adaugă coloana approved dacă lipsește (baze vechi)
-        cols = [r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()]
-        if "approved" not in cols:
-            c.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 0")
-        # populează echipele dacă tabelul e gol
-        if not c.execute("SELECT 1 FROM teams LIMIT 1").fetchone():
-            for label, names in TEAMS.items():
-                for n in names:
-                    c.execute(
-                        "INSERT OR IGNORE INTO teams(name, group_label) VALUES(?,?)",
-                        (n, label),
-                    )
+    db_run("""CREATE TABLE IF NOT EXISTS users(
+        telegram_id INTEGER PRIMARY KEY,
+        username TEXT, full_name TEXT,
+        approved INTEGER DEFAULT 0, joined_at TEXT)""")
+    db_run("""CREATE TABLE IF NOT EXISTS global_predictions(
+        telegram_id INTEGER, kind TEXT, value TEXT,
+        PRIMARY KEY(telegram_id, kind))""")
+    db_run("""CREATE TABLE IF NOT EXISTS matches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        stage TEXT, grp TEXT, home TEXT, away TEXT, kickoff TEXT,
+        venue TEXT, teams_known INTEGER DEFAULT 1, note TEXT,
+        result_home INTEGER, result_away INTEGER, finished INTEGER DEFAULT 0)""")
+    db_run("""CREATE TABLE IF NOT EXISTS match_predictions(
+        telegram_id INTEGER, match_id INTEGER, pick TEXT,
+        PRIMARY KEY(telegram_id, match_id))""")
+    db_run("""CREATE TABLE IF NOT EXISTS results(kind TEXT PRIMARY KEY, value TEXT)""")
+    db_run("""CREATE TABLE IF NOT EXISTS bonus(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER, points REAL, reason TEXT, created_at TEXT)""")
+    db_run("""CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT)""")
+
+    if get_config("seeded") != "1":
+        for m in SEED_MATCHES:
+            db_run("""INSERT INTO matches(stage,grp,home,away,kickoff,venue,teams_known,note)
+                      VALUES(?,?,?,?,?,?,?,?)""", m)
+        set_config("seeded", "1")
+        log.info("Meciuri inițializate: %d", len(SEED_MATCHES))
 
 
-def get_config(key):
-    with db() as c:
-        r = c.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
-        return r["value"] if r else None
+def get_config(key, default=None):
+    row = db_one("SELECT value FROM config WHERE key=?", (key,))
+    return row["value"] if row else default
 
 
 def set_config(key, value):
-    with db() as c:
-        c.execute(
-            "INSERT INTO config(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
-        )
+    db_run("INSERT OR REPLACE INTO config(key,value) VALUES(?,?)", (key, str(value)))
 
 
-# ------------------------------------------------------------------ #
-#  UTILITARE
-# ------------------------------------------------------------------ #
-def is_admin(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id in ADMIN_IDS
+# ==============================================================================
+#  HELPERE
+# ==============================================================================
+
+def norm(s):
+    """Normalizează pentru comparații (fără diacritice, lowercase)."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.strip().lower()
 
 
-def now_local() -> datetime:
-    return datetime.now(TZ).replace(tzinfo=None)
+def is_admin(uid):
+    return uid in ADMIN_IDS
 
 
-def is_approved(uid: int) -> bool:
-    if uid in ADMIN_IDS:
-        return True
-    with db() as c:
-        r = c.execute("SELECT approved FROM users WHERE user_id=?", (uid,)).fetchone()
-        return bool(r and r["approved"])
+def open_groups():
+    return [g.strip() for g in (get_config("open_groups", "A,B")).split(",") if g.strip()]
 
 
-async def guard(update: Update) -> bool:
-    """Lasă să treacă doar participanții aprobați."""
-    if is_approved(update.effective_user.id):
-        return True
-    await update.message.reply_text(
-        "⏳ Ești în așteptare. Organizatorul te aprobă după ce achiți cotizația.\n"
-        "După ce ești aprobat, dă din nou /campioana."
-    )
-    return False
+def fmt_pts(p):
+    p = float(p)
+    return str(int(p)) if p == int(p) else f"{p:.1f}"
 
 
-def picks_open() -> bool:
-    dl = get_config("picks_deadline")
-    if not dl:
-        return True
+def parse_score(text):
+    """'2-1' / '2:1' / '2 1' -> (2,1) sau None."""
+    t = text.strip().replace(":", "-").replace(" ", "-")
+    while "--" in t:
+        t = t.replace("--", "-")
+    parts = t.split("-")
+    if len(parts) != 2:
+        return None
     try:
-        return now_local() < datetime.strptime(dl, "%Y-%m-%d %H:%M")
+        h, a = int(parts[0]), int(parts[1])
     except ValueError:
-        return True
+        return None
+    if 0 <= h <= 30 and 0 <= a <= 30:
+        return (h, a)
+    return None
 
 
-def match_open(kickoff: str) -> bool:
+def outcome(h, a):
+    return "1" if h > a else ("X" if h == a else "2")
+
+
+def fmt_kick(kickoff):
     try:
-        return now_local() < datetime.strptime(kickoff, "%Y-%m-%d %H:%M")
+        d = datetime.strptime(kickoff, "%Y-%m-%d %H:%M")
+        return d.strftime("%d.%m, %H:%M")
     except ValueError:
-        return True
+        return kickoff
 
 
-def is_group_stage(stage: str) -> bool:
-    s = (stage or "").lower()
-    return "grup" in s or "group" in s
+def now_str():
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
 
 
-def register_user(update: Update):
-    u = update.effective_user
-    appr = 1 if u.id in ADMIN_IDS else 0
-    with db() as c:
-        c.execute(
-            "INSERT INTO users(user_id, username, full_name, approved, joined_at) "
-            "VALUES(?,?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
-            "full_name=excluded.full_name",
-            (u.id, u.username or "", u.full_name, appr, now_local().isoformat()),
-        )
+def current_window(now=None):
+    now = now or datetime.now(TZ)
+    if now.hour >= DAILY_HOUR:
+        start = now.replace(hour=DAILY_HOUR, minute=0, second=0, microsecond=0)
+    else:
+        start = (now - timedelta(days=1)).replace(
+            hour=DAILY_HOUR, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
 
 
-def pick_label(home, away, pick):
-    return {"HOME": home, "DRAW": "Egal", "AWAY": away}.get(pick, pick)
+def matches_in(start_dt, end_dt):
+    s = start_dt.strftime("%Y-%m-%d %H:%M")
+    e = end_dt.strftime("%Y-%m-%d %H:%M")
+    return db_all(
+        "SELECT * FROM matches WHERE kickoff>=? AND kickoff<? ORDER BY kickoff", (s, e))
 
 
-def matches_on(date_str):
-    with db() as c:
-        return c.execute(
-            "SELECT * FROM matches WHERE kickoff LIKE ? ORDER BY kickoff",
-            (date_str + "%",),
-        ).fetchall()
+def find_team(query, pool):
+    """Caută o echipă într-o listă, tolerant la diacritice / litere mari."""
+    q = norm(query)
+    for t in pool:
+        if norm(t) == q:
+            return t
+    matches = [t for t in pool if q in norm(t)]
+    return matches[0] if len(matches) == 1 else None
 
 
-async def notify_admins(context, text):
-    for aid in ADMIN_IDS:
-        try:
-            await context.bot.send_message(chat_id=aid, text=text)
-        except Exception:
-            pass
+def find_player(query):
+    q = norm(query)
+    for n in TS_NAMES:
+        if norm(n) == q:
+            return n
+    matches = [n for n in TS_NAMES if q in norm(n)]
+    return matches[0] if len(matches) == 1 else None
 
 
-# ------------------------------------------------------------------ #
-#  CALCULUL PUNCTAJULUI (doar participanți aprobați)
-# ------------------------------------------------------------------ #
-def compute_scores():
-    with db() as c:
-        users = c.execute(
-            "SELECT user_id, full_name, username FROM users WHERE approved=1"
-        ).fetchall()
-        match_results = dict(
-            c.execute(
-                "SELECT match_id, result FROM matches WHERE result IS NOT NULL"
-            ).fetchall()
-        )
-        preds = c.execute(
-            "SELECT user_id, match_id, pick FROM match_predictions"
-        ).fetchall()
-        group_results = dict(
-            c.execute("SELECT group_label, winner_team FROM group_results").fetchall()
-        )
-        gpicks = c.execute(
-            "SELECT user_id, group_label, team_name FROM group_picks"
-        ).fetchall()
-        cpicks = dict(
-            c.execute("SELECT user_id, team_name FROM champion_picks").fetchall()
-        )
+# ==============================================================================
+#  PUNCTAJ
+# ==============================================================================
 
-    champ = get_config("champion_winner")
-    approved_ids = {u["user_id"] for u in users}
+def score_user(uid, results=None):
+    """Returnează (total, listă_linii) pentru un participant."""
+    if results is None:
+        results = {r["kind"]: r["value"] for r in db_all("SELECT kind,value FROM results")}
+    total = 0.0
+    lines = []
 
-    match_pts = {uid: 0 for uid in approved_ids}
-    for p in preds:
-        if p["user_id"] in approved_ids:
-            res = match_results.get(p["match_id"])
-            if res and res == p["pick"]:
-                match_pts[p["user_id"]] += POINTS_MATCH
+    gp = {r["kind"]: r["value"] for r in
+          db_all("SELECT kind,value FROM global_predictions WHERE telegram_id=?", (uid,))}
 
-    group_pts = {uid: 0 for uid in approved_ids}
-    for g in gpicks:
-        if g["user_id"] in approved_ids and group_results.get(g["group_label"]) == g["team_name"]:
-            group_pts[g["user_id"]] += POINTS_GROUP
+    # Campioana
+    if "champion" in gp:
+        real = results.get("champion")
+        if real:
+            ok = norm(gp["champion"]) == norm(real)
+            total += 5 if ok else 0
+            lines.append(f"Campioană: {gp['champion']} {'✅ +5' if ok else '❌'}")
+        else:
+            lines.append(f"Campioană: {gp['champion']} ⏳")
 
-    champ_pts = {uid: 0 for uid in approved_ids}
-    if champ:
-        for uid, team in cpicks.items():
-            if uid in approved_ids and team == champ:
-                champ_pts[uid] = POINTS_CHAMPION
+    # Golgheter
+    if "topscorer" in gp:
+        real = results.get("topscorer")
+        if real:
+            ok = (norm(gp["topscorer"]) == norm(real)) or \
+                 (gp["topscorer"] == "ALTUL" and find_player(real) is None)
+            total += 4 if ok else 0
+            lines.append(f"Golgheter: {gp['topscorer']} {'✅ +4' if ok else '❌'}")
+        else:
+            lines.append(f"Golgheter: {gp['topscorer']} ⏳")
 
+    # Grupe
+    for k in sorted(gp):
+        if not k.startswith("group_"):
+            continue
+        letter = k.split("_")[1]
+        real = results.get(k)
+        if real:
+            ok = norm(gp[k]) == norm(real)
+            total += 2 if ok else 0
+            lines.append(f"Grupa {letter}: {gp[k]} {'✅ +2' if ok else '❌'}")
+        else:
+            lines.append(f"Grupa {letter}: {gp[k]} ⏳")
+
+    # Meciuri
+    preds = db_all("SELECT match_id, pick FROM match_predictions WHERE telegram_id=?", (uid,))
+    if preds:
+        ids = [str(p["match_id"]) for p in preds]
+        rows = db_all(
+            f"SELECT * FROM matches WHERE id IN ({','.join('?' * len(ids))})", ids)
+        mby = {r["id"]: r for r in rows}
+        mpts = 0.0
+        for p in preds:
+            m = mby.get(p["match_id"])
+            if not m or not m["finished"] or m["result_home"] is None:
+                continue
+            rh, ra = m["result_home"], m["result_away"]
+            res_out = outcome(rh, ra)
+            pick = p["pick"]
+            gained = 0
+            if pick in ("1", "X", "2"):
+                if pick == res_out:
+                    gained = 3
+            else:
+                sc = parse_score(pick)
+                if sc:
+                    if sc == (rh, ra):
+                        gained = 5
+                    elif outcome(*sc) == res_out:
+                        gained = 3
+            mpts += gained
+        if mpts:
+            lines.append(f"Meciuri: +{fmt_pts(mpts)}p")
+        total += mpts
+
+    # Bonus
+    brow = db_one("SELECT COALESCE(SUM(points),0) s FROM bonus WHERE telegram_id=?", (uid,))
+    bsum = brow["s"] if brow else 0
+    if bsum:
+        total += bsum
+        lines.append(f"Bonus: {'+' if bsum >= 0 else ''}{fmt_pts(bsum)}p")
+
+    return total, lines
+
+
+def leaderboard():
+    results = {r["kind"]: r["value"] for r in db_all("SELECT kind,value FROM results")}
+    users = db_all("SELECT telegram_id, full_name FROM users WHERE approved=1")
     rows = []
     for u in users:
-        uid = u["user_id"]
-        m, g, ch = match_pts.get(uid, 0), group_pts.get(uid, 0), champ_pts.get(uid, 0)
-        rows.append((u, m + g + ch, m, g, ch))
-    rows.sort(key=lambda x: x[1], reverse=True)
+        total, _ = score_user(u["telegram_id"], results)
+        rows.append((u["full_name"] or "—", total))
+    rows.sort(key=lambda x: (-x[1], x[0].lower()))
     return rows
 
 
-def leaderboard_text():
-    rows = compute_scores()
+def render_leaderboard():
+    rows = leaderboard()
     if not rows:
-        return "Încă nu există participanți aprobați."
-    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
-    lines = ["🏆 CLASAMENT\n"]
-    for i, (u, total, m, g, ch) in enumerate(rows):
-        name = u["full_name"] or (u["username"] and "@" + u["username"]) or str(u["user_id"])
-        prefix = medals.get(i, f"{i + 1}.")
-        lines.append(f"{prefix} {name} — {total} pct  (M:{m} G:{g} C:{ch})")
-    lines.append("\nLegendă: M = meciuri, G = grupe, C = campioană")
-    return "\n".join(lines)
+        return "🏆 CLASAMENT\n\nNiciun participant încă."
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    out = ["🏆 CLASAMENT\n"]
+    rank, prev = 0, None
+    for i, (name, pts) in enumerate(rows, 1):
+        if pts != prev:
+            rank = i
+            prev = pts
+        tag = medals.get(rank, f"{rank}.")
+        out.append(f"{tag} {name} — {fmt_pts(pts)}p")
+    return "\n".join(out)
 
 
-# ------------------------------------------------------------------ #
-#  COMENZI PARTICIPANȚI
-# ------------------------------------------------------------------ #
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    with db() as c:
-        existing = c.execute(
-            "SELECT approved FROM users WHERE user_id=?", (u.id,)
-        ).fetchone()
-    register_user(update)
-    approved = is_approved(u.id)
+# ==============================================================================
+#  TASTATURI
+# ==============================================================================
 
-    if approved:
-        txt = (
-            "⚽️ *Bun venit la Concursul Cupa Mondială!*\n\n"
-            "Punctaj: campioană 5p · grupă 2p · meci 3p\n\n"
-            "Pași:\n"
-            "1️⃣ /campioana — alege campioana turneului\n"
-            "2️⃣ /grupe — alege câștigătoarea fiecărei grupe\n"
-            "3️⃣ În fiecare zi primești meciurile de mâine și pronostichezi cu un tap.\n\n"
-            "/azi · /maine · /pronosticurile · /clasament · /premii · /ajutor"
-        )
-        await update.message.reply_text(txt, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(
-            "👋 Salut! Te-ai înscris la concurs.\n\n"
-            "⏳ Ești *în așteptare* — organizatorul te aprobă după ce achiți cotizația.\n"
-            "Imediat ce ești aprobat primești un mesaj și poți începe pronosticurile.",
-            parse_mode="Markdown",
-        )
-        if not existing:
-            await notify_admins(
-                context,
-                f"🆕 Cerere de înscriere:\n"
-                f"{u.full_name} (@{u.username or '—'})\n"
-                f"ID: {u.id}\n\n"
-                f"Aprobă cu:  /approve {u.id}",
-            )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "Comenzi:\n"
-        "/campioana — alege campioana\n"
-        "/grupe — alege câștigătoarele de grupă\n"
-        "/azi — meciurile de azi\n"
-        "/maine — meciurile de mâine\n"
-        "/pronosticurile — pronosticurile tale\n"
-        "/clasament — clasamentul\n"
-        "/premii — premiile"
-    )
-    if is_admin(update):
-        txt += (
-            "\n\n🔧 Admin:\n"
-            "/pending — cereri în așteptare\n"
-            "/approve <id sau @user> — aprobă participant\n"
-            "/deny <id> — respinge/scoate participant\n"
-            "/participanti — lista celor aprobați\n"
-            "/allpicks — pronosticurile tuturor (pe scurt)\n"
-            "/picks <id sau @user> — pronosticurile complete ale cuiva\n"
-            "/matchpicks <id_meci> — cine ce a pronosticat la un meci\n"
-            "/addmatch Echipa1 | Echipa2 | YYYY-MM-DD HH:MM | Faza\n"
-            "/setresult <id_meci> <HOME|DRAW|AWAY>\n"
-            "/setgroupwinner <Grupa> <Echipa>\n"
-            "/setchampion <Echipa>\n"
-            "/setpot <suma> [moneda]\n"
-            "/setdeadline YYYY-MM-DD HH:MM\n"
-            "/setchat — setează grupul curent\n"
-            "/listmatches — lista meciurilor\n"
-            "/announcetomorrow — trimite meciurile de mâine\n"
-            "/postleaderboard — postează clasamentul\n"
-            "/reset_game CONFIRM — șterge pronosticuri+rezultate (ține restul)\n"
-            "/reset_all CONFIRM — resetare totală (de fabrică)"
-        )
-    await update.message.reply_text(txt)
-
-
-# ---------- Campioana ---------- #
-def champ_keyboard(page=0, per=12):
-    with db() as c:
-        teams = c.execute(
-            "SELECT team_id, name FROM teams ORDER BY group_label, name"
-        ).fetchall()
-    total = len(teams)
-    chunk = teams[page * per: page * per + per]
-    rows, row = [], []
-    for t in chunk:
-        row.append(InlineKeyboardButton(t["name"], callback_data=f"champ:set:{t['team_id']}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀️", callback_data=f"champ:page:{page - 1}"))
-    if (page + 1) * per < total:
-        nav.append(InlineKeyboardButton("▶️", callback_data=f"champ:page:{page + 1}"))
-    if nav:
-        rows.append(nav)
+def kb_champion():
+    btns = [InlineKeyboardButton(t, callback_data=f"champ:{i}")
+            for i, t in enumerate(ALL_TEAMS)]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     return InlineKeyboardMarkup(rows)
 
 
-async def cmd_campioana(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update)
-    if not await guard(update):
-        return
-    if not picks_open():
-        await update.message.reply_text("⛔️ Perioada de pronostic pentru campioană s-a încheiat.")
-        return
-    with db() as c:
-        cur = c.execute(
-            "SELECT team_name FROM champion_picks WHERE user_id=?",
-            (update.effective_user.id,),
-        ).fetchone()
-    extra = f"\n\nAlegerea ta actuală: {cur['team_name']}" if cur else ""
-    await update.message.reply_text(
-        "Alege *campioana* turneului:" + extra,
-        parse_mode="Markdown",
-        reply_markup=champ_keyboard(0),
-    )
+def kb_topscorers_fav():
+    btns = [InlineKeyboardButton(f"{n} ({fmt_pts(c)})",
+                                 callback_data=f"ts:{TS_NAMES.index(n)}")
+            for n, c in TS_FAVORITES]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton("🔍 Alt jucător", callback_data="ts:search")])
+    return InlineKeyboardMarkup(rows)
 
 
-async def cb_champ(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    parts = q.data.split(":")
-    if parts[1] == "page":
-        await q.edit_message_reply_markup(reply_markup=champ_keyboard(int(parts[2])))
-        return
-    if not is_approved(q.from_user.id):
-        await q.edit_message_text("⏳ Aștepți aprobarea organizatorului.")
-        return
-    if not picks_open():
-        await q.edit_message_text("⛔️ Perioada de pronostic s-a încheiat.")
-        return
-    team_id = int(parts[2])
-    with db() as c:
-        t = c.execute("SELECT name FROM teams WHERE team_id=?", (team_id,)).fetchone()
-        if not t:
-            return
-        c.execute(
-            "INSERT INTO champion_picks(user_id, team_name) VALUES(?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET team_name=excluded.team_name",
-            (q.from_user.id, t["name"]),
-        )
-    await q.edit_message_text(f"✅ Campioana ta: *{t['name']}*\n(o poți schimba cu /campioana)", parse_mode="Markdown")
+def kb_topscorers_search(found):
+    btns = [InlineKeyboardButton(n, callback_data=f"ts:{TS_NAMES.index(n)}")
+            for n in found[:12]]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton("🔍 Caută din nou", callback_data="ts:search"),
+                 InlineKeyboardButton("❓ ALTUL", callback_data="ts:other")])
+    return InlineKeyboardMarkup(rows)
 
 
-# ---------- Grupe ---------- #
-def groups_menu_keyboard(user_id):
-    with db() as c:
-        picked = dict(
-            c.execute(
-                "SELECT group_label, team_name FROM group_picks WHERE user_id=?",
-                (user_id,),
-            ).fetchall()
-        )
-    rows, row = [], []
-    for label in sorted(TEAMS.keys()):
-        mark = "✅" if label in picked else "⚪️"
-        row.append(InlineKeyboardButton(f"{mark} Grupa {label}", callback_data=f"grp:open:{label}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(rows), picked
+def kb_group(letter):
+    teams = GROUPS[letter]
+    btns = [InlineKeyboardButton(t, callback_data=f"grp:{letter}:{i}")
+            for i, t in enumerate(teams)]
+    return InlineKeyboardMarkup([btns[i:i + 2] for i in range(0, len(btns), 2)])
 
 
-async def cmd_grupe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update)
-    if not await guard(update):
-        return
-    if not picks_open():
-        await update.message.reply_text("⛔️ Perioada de pronostic pentru grupe s-a încheiat.")
-        return
-    kb, picked = groups_menu_keyboard(update.effective_user.id)
-    await update.message.reply_text(
-        f"Alege câștigătoarea fiecărei grupe ({len(picked)}/{len(TEAMS)} completate):",
-        reply_markup=kb,
-    )
+def kb_match_scores(win, mid):
+    rows = []
+    for row in SCORE_ROWS:
+        line = []
+        for label in row:
+            pick = "alt" if label.startswith("✏️") else label
+            line.append(InlineKeyboardButton(label, callback_data=f"sp:{win}:{mid}:{pick}"))
+        rows.append(line)
+    rows.append([InlineKeyboardButton("« Înapoi la meciuri", callback_data=f"bl:{win}")])
+    return InlineKeyboardMarkup(rows)
 
 
-async def cb_grp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    parts = q.data.split(":")
-    action = parts[1]
-
-    if not is_approved(q.from_user.id):
-        await q.edit_message_text("⏳ Aștepți aprobarea organizatorului.")
-        return
-
-    if action == "menu":
-        kb, picked = groups_menu_keyboard(q.from_user.id)
-        await q.edit_message_text(
-            f"Alege câștigătoarea fiecărei grupe ({len(picked)}/{len(TEAMS)} completate):",
-            reply_markup=kb,
-        )
-        return
-
-    if action == "open":
-        label = parts[2]
-        with db() as c:
-            teams = c.execute(
-                "SELECT team_id, name FROM teams WHERE group_label=? ORDER BY name",
-                (label,),
-            ).fetchall()
-            cur = c.execute(
-                "SELECT team_name FROM group_picks WHERE user_id=? AND group_label=?",
-                (q.from_user.id, label),
-            ).fetchone()
-        rows = []
-        for t in teams:
-            mark = "✅ " if cur and cur["team_name"] == t["name"] else ""
-            rows.append([InlineKeyboardButton(mark + t["name"], callback_data=f"grp:set:{label}:{t['team_id']}")])
-        rows.append([InlineKeyboardButton("⬅️ Înapoi la grupe", callback_data="grp:menu")])
-        await q.edit_message_text(
-            f"Grupa {label} — alege câștigătoarea:",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
-
-    if action == "set":
-        if not picks_open():
-            await q.edit_message_text("⛔️ Perioada de pronostic s-a încheiat.")
-            return
-        label, team_id = parts[2], int(parts[3])
-        with db() as c:
-            t = c.execute("SELECT name FROM teams WHERE team_id=?", (team_id,)).fetchone()
-            c.execute(
-                "INSERT INTO group_picks(user_id, group_label, team_name) VALUES(?,?,?) "
-                "ON CONFLICT(user_id, group_label) DO UPDATE SET team_name=excluded.team_name",
-                (q.from_user.id, label, t["name"]),
-            )
-        kb, picked = groups_menu_keyboard(q.from_user.id)
-        await q.edit_message_text(
-            f"✅ Grupa {label}: {t['name']}\n\nContinuă ({len(picked)}/{len(TEAMS)} completate):",
-            reply_markup=kb,
-        )
-
-
-# ---------- Meciuri / pronostic ---------- #
-def match_kb(match, current_pick=None):
-    home, away, stage = match["home"], match["away"], match["stage"]
-    mid = match["match_id"]
-
-    def lbl(text, pick):
-        return ("✅ " if current_pick == pick else "") + text
-
-    buttons = [InlineKeyboardButton(lbl("🏠 " + home, "HOME"), callback_data=f"m:{mid}:HOME")]
-    if is_group_stage(stage):
-        buttons.append(InlineKeyboardButton(lbl("🤝 Egal", "DRAW"), callback_data=f"m:{mid}:DRAW"))
-    buttons.append(InlineKeyboardButton(lbl("✈️ " + away, "AWAY"), callback_data=f"m:{mid}:AWAY"))
-    return InlineKeyboardMarkup([buttons])
-
-
-def match_text(match):
-    t = match["kickoff"].split(" ")[1] if " " in match["kickoff"] else match["kickoff"]
-    return f"🕐 {t} — {match['home']} vs {match['away']}\n({match['stage']})"
-
-
-async def send_match_prompt(bot, chat_id, match, user_id):
-    with db() as c:
-        p = c.execute(
-            "SELECT pick FROM match_predictions WHERE user_id=? AND match_id=?",
-            (user_id, match["match_id"]),
-        ).fetchone()
-    current = p["pick"] if p else None
-    await bot.send_message(
-        chat_id=chat_id,
-        text=match_text(match),
-        reply_markup=match_kb(match, current),
-    )
-
-
-async def _show_day(update, context, date_str, eticheta):
-    matches = matches_on(date_str)
-    if not matches:
-        await update.message.reply_text(f"Nu sunt meciuri {eticheta}. 🌙")
-        return
-    await update.message.reply_text(f"📅 *Meciurile {eticheta}* — pronostichează:", parse_mode="Markdown")
-    for m in matches:
-        if match_open(m["kickoff"]):
-            await send_match_prompt(context.bot, update.effective_chat.id, m, update.effective_user.id)
+def kb_match_list(win, uid):
+    start, end = current_window()
+    if win == "m":
+        start, end = end, end + timedelta(days=1)
+    ms = matches_in(start, end)
+    rows = []
+    for m in ms:
+        pred = db_one(
+            "SELECT pick FROM match_predictions WHERE telegram_id=? AND match_id=?",
+            (uid, m["id"]))
+        if not m["teams_known"]:
+            label = f"🔒 {fmt_kick(m['kickoff'])} {m['home']} – {m['away']}"
+            rows.append([InlineKeyboardButton(label, callback_data="noop")])
+        elif m["kickoff"] <= now_str():
+            tag = f" (tu: {pred['pick']})" if pred else ""
+            label = f"⏱ {fmt_kick(m['kickoff'])} {m['home']}–{m['away']}{tag}"
+            rows.append([InlineKeyboardButton(label, callback_data="noop")])
         else:
-            await update.message.reply_text(match_text(m) + "\n⛔️ Început — pronosticul e închis.")
+            tag = f" ✅{pred['pick']}" if pred else ""
+            label = f"⚽️ {fmt_kick(m['kickoff'])} {m['home']}–{m['away']}{tag}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"po:{win}:{m['id']}")])
+    return ms, InlineKeyboardMarkup(rows) if rows else None
 
 
-async def cmd_azi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update)
-    if not await guard(update):
+# ==============================================================================
+#  ÎNROLARE (onboarding)
+# ==============================================================================
+
+async def prompt_next(bot, chat_id, uid):
+    """Trimite următorul pas obligatoriu, sau meniul dacă s-a terminat."""
+    gp = {r["kind"] for r in
+          db_all("SELECT kind FROM global_predictions WHERE telegram_id=?", (uid,))}
+
+    if "champion" not in gp:
+        await bot.send_message(chat_id, "1️⃣ Alege CAMPIOANA mondială:\n"
+                               "(atenție: alegerea NU se mai poate schimba)",
+                               reply_markup=kb_champion())
         return
-    await _show_day(update, context, now_local().strftime("%Y-%m-%d"), "de azi")
-
-
-async def cmd_maine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update)
-    if not await guard(update):
+    if "topscorer" not in gp:
+        await bot.send_message(chat_id, "2️⃣ Alege GOLGHETERUL turneului:\n"
+                               "(cei mai cotați sunt mai jos; pentru altcineva apasă 'Alt jucător')",
+                               reply_markup=kb_topscorers_fav())
         return
-    await _show_day(update, context, (now_local() + timedelta(days=1)).strftime("%Y-%m-%d"), "de mâine")
+    for L in open_groups():
+        if f"group_{L}" not in gp:
+            await bot.send_message(chat_id, f"Alege CÂȘTIGĂTOAREA Grupei {L}:",
+                                   reply_markup=kb_group(L))
+            return
+
+    await bot.send_message(
+        chat_id,
+        "✅ Gata! Ți-ai trimis toate pronosticurile obligatorii.\n\n"
+        + POINTS_TEXT +
+        "\n\nDe acum: /azi · /maine ca să pariezi pe meciuri.\n"
+        "/pronosticurile · /clasament · /premii · /ajutor")
 
 
-async def cb_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_approved(q.from_user.id):
-        await q.answer("⏳ Aștepți aprobarea organizatorului.", show_alert=True)
+# ==============================================================================
+#  COMENZI UTILIZATOR
+# ==============================================================================
+
+WELCOME = (
+    "⚽️ Bun venit la Concursul Cupa Mondială 2026!\n\n"
+    + POINTS_TEXT +
+    "\n\n📌 Comenzi: /azi · /maine · /pronosticurile · /clasament · /premii · /ajutor"
+)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type != "private":
+        me = (await context.bot.get_me()).username
+        await update.message.reply_text(
+            f"Salut! Ca să intri în concurs, scrie-mi în privat: @{me}")
         return
-    _, mid, pick = q.data.split(":")
-    mid = int(mid)
-    with db() as c:
-        m = c.execute("SELECT * FROM matches WHERE match_id=?", (mid,)).fetchone()
-    if not m:
-        await q.answer("Meci inexistent.")
+
+    row = db_one("SELECT * FROM users WHERE telegram_id=?", (user.id,))
+    if row is None:
+        db_run("""INSERT INTO users(telegram_id,username,full_name,approved,joined_at)
+                  VALUES(?,?,?,0,?)""",
+               (user.id, user.username or "", user.full_name, now_str()))
+        # anunță adminul cu butoane
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Aprobă", callback_data=f"adm:ok:{user.id}"),
+            InlineKeyboardButton("❌ Respinge", callback_data=f"adm:no:{user.id}")]])
+        uname = f"@{user.username}" if user.username else "(fără username)"
+        for aid in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    aid, f"🆕 Cerere de înscriere:\n{user.full_name} {uname}\nID: {user.id}",
+                    reply_markup=kb)
+            except Exception as e:
+                log.warning("Nu pot anunța adminul %s: %s", aid, e)
+        await update.message.reply_text(
+            "Cererea ta a fost trimisă. ⏳ Așteaptă aprobarea adminului.")
         return
-    if not match_open(m["kickoff"]):
-        await q.answer("⛔️ Meciul a început, nu mai poți pronostica.", show_alert=True)
+
+    if not row["approved"]:
+        await update.message.reply_text("⏳ Încă aștepți aprobarea adminului.")
         return
-    with db() as c:
-        c.execute(
-            "INSERT INTO match_predictions(user_id, match_id, pick, created_at) "
-            "VALUES(?,?,?,?) "
-            "ON CONFLICT(user_id, match_id) DO UPDATE SET pick=excluded.pick, created_at=excluded.created_at",
-            (q.from_user.id, mid, pick, now_local().isoformat()),
-        )
-    await q.answer(f"Salvat: {pick_label(m['home'], m['away'], pick)} ✅")
-    await q.edit_message_reply_markup(reply_markup=match_kb(m, pick))
+
+    await update.message.reply_text(WELCOME)
+    await prompt_next(context.bot, chat.id, user.id)
 
 
-async def cmd_pronosticurile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
-    uid = update.effective_user.id
-    with db() as c:
-        champ = c.execute("SELECT team_name FROM champion_picks WHERE user_id=?", (uid,)).fetchone()
-        gpicks = c.execute(
-            "SELECT group_label, team_name FROM group_picks WHERE user_id=? ORDER BY group_label",
-            (uid,),
-        ).fetchall()
-        mpicks = c.execute(
-            "SELECT m.home, m.away, mp.pick "
-            "FROM match_predictions mp JOIN matches m ON m.match_id=mp.match_id "
-            "WHERE mp.user_id=? ORDER BY m.kickoff",
-            (uid,),
-        ).fetchall()
-    lines = ["📋 *Pronosticurile tale*\n"]
-    lines.append(f"🏆 Campioană: {champ['team_name'] if champ else '—'}")
-    lines.append("\n📊 Grupe:")
-    lines += [f"  • Grupa {g['group_label']}: {g['team_name']}" for g in gpicks] or ["  —"]
-    lines.append("\n⚽️ Meciuri:")
-    if mpicks:
-        lines += [f"  • {mp['home']} vs {mp['away']}: {pick_label(mp['home'], mp['away'], mp['pick'])}" for mp in mpicks]
-    else:
-        lines.append("  —")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_clasament(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
-    await update.message.reply_text(leaderboard_text())
+async def cmd_ajutor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        WELCOME + "\n\n• /grupe — alege câștigătoarele grupelor deschise\n"
+        "• Pronosticul pe un meci se poate schimba până începe meciul.")
 
 
 async def cmd_premii(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update):
-        return
-    pot_per = float(get_config("pot_per_person") or 0)
-    currency = get_config("currency") or "RON"
-    with db() as c:
-        n = c.execute("SELECT COUNT(*) AS n FROM users WHERE approved=1").fetchone()["n"]
-    pot = n * pot_per
-    txt = (
-        "🎁 *Premii (din cotizație)*\n\n"
-        f"Participanți aprobați: {n}\n"
-        f"Cotizație/persoană: {pot_per:g} {currency}\n"
-        f"Fond total: {pot:g} {currency}\n\n"
-        f"🥇 Locul 1: {pot * 0.5:g} {currency} *+ tricou*\n"
-        f"🥈 Locul 2: {pot * 0.3:g} {currency}\n"
-        f"🥉 Locul 3: {pot * 0.2:g} {currency}"
-    )
-    await update.message.reply_text(txt, parse_mode="Markdown")
-
-
-# ------------------------------------------------------------------ #
-#  COMENZI ADMIN — aprobare
-# ------------------------------------------------------------------ #
-async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    with db() as c:
-        rows = c.execute(
-            "SELECT user_id, full_name, username FROM users WHERE approved=0 ORDER BY joined_at"
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("Nicio cerere în așteptare. ✅")
-        return
-    lines = ["⏳ În așteptare:\n"]
-    for r in rows:
-        lines.append(f"• {r['full_name']} (@{r['username'] or '—'}) — /approve {r['user_id']}")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if not context.args:
-        await update.message.reply_text("Format: /approve <id> sau /approve @username (vezi /pending)")
-        return
-    arg = context.args[0]
-    with db() as c:
-        if arg.startswith("@"):
-            row = c.execute("SELECT user_id, full_name FROM users WHERE username=?", (arg[1:],)).fetchone()
-        elif arg.isdigit():
-            row = c.execute("SELECT user_id, full_name FROM users WHERE user_id=?", (int(arg),)).fetchone()
-        else:
-            row = None
-        if not row:
-            await update.message.reply_text("Nu am găsit persoana. Roagă-l să dea /start, apoi vezi /pending.")
-            return
-        c.execute("UPDATE users SET approved=1 WHERE user_id=?", (row["user_id"],))
-    await update.message.reply_text(f"✅ Aprobat: {row['full_name']}")
-    try:
-        await context.bot.send_message(
-            chat_id=row["user_id"],
-            text="✅ Ai fost aprobat! Acum poți pronostica:\n1️⃣ /campioana\n2️⃣ /grupe",
-        )
-    except Exception:
-        pass
-
-
-async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Format: /deny <id> (scoate persoana și pronosticurile ei)")
-        return
-    uid = int(context.args[0])
-    with db() as c:
-        for t in ("match_predictions", "group_picks", "champion_picks"):
-            c.execute(f"DELETE FROM {t} WHERE user_id=?", (uid,))
-        c.execute("DELETE FROM users WHERE user_id=?", (uid,))
-    await update.message.reply_text("🚫 Persoana a fost scoasă din concurs.")
-
-
-async def cmd_participanti(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    with db() as c:
-        rows = c.execute(
-            "SELECT full_name, username FROM users WHERE approved=1 ORDER BY full_name"
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("Niciun participant aprobat încă.")
-        return
-    lines = [f"✅ Participanți aprobați ({len(rows)}):\n"]
-    lines += [f"• {r['full_name']} (@{r['username'] or '—'})" for r in rows]
-    await update.message.reply_text("\n".join(lines))
-
-
-# ------------------------------------------------------------------ #
-#  COMENZI ADMIN — vizualizare pronosticuri
-# ------------------------------------------------------------------ #
-async def cmd_allpicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    with db() as c:
-        users = c.execute(
-            "SELECT user_id, full_name FROM users WHERE approved=1 ORDER BY full_name"
-        ).fetchall()
-        champs = dict(c.execute("SELECT user_id, team_name FROM champion_picks").fetchall())
-        gcounts = dict(c.execute("SELECT user_id, COUNT(*) FROM group_picks GROUP BY user_id").fetchall())
-        mcounts = dict(c.execute("SELECT user_id, COUNT(*) FROM match_predictions GROUP BY user_id").fetchall())
-    if not users:
-        await update.message.reply_text("Niciun participant aprobat.")
-        return
-    lines = ["📋 Pronosticuri — toți participanții\n"]
-    for u in users:
-        uid = u["user_id"]
-        lines.append(
-            f"• {u['full_name']} — 🏆 {champs.get(uid, '—')} | "
-            f"Grupe: {gcounts.get(uid, 0)}/{len(TEAMS)} | Meciuri: {mcounts.get(uid, 0)}"
-        )
-    lines.append("\nDetalii complete pentru cineva: /picks <id sau @user>")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "Format: /picks <id sau @username> (vezi /participanti).\nPentru toți deodată: /allpicks"
-        )
-        return
-    arg = context.args[0]
-    with db() as c:
-        if arg.startswith("@"):
-            u = c.execute("SELECT user_id, full_name FROM users WHERE username=?", (arg[1:],)).fetchone()
-        elif arg.isdigit():
-            u = c.execute("SELECT user_id, full_name FROM users WHERE user_id=?", (int(arg),)).fetchone()
-        else:
-            u = None
-        if not u:
-            await update.message.reply_text("Nu am găsit persoana. Vezi /participanti.")
-            return
-        uid = u["user_id"]
-        champ = c.execute("SELECT team_name FROM champion_picks WHERE user_id=?", (uid,)).fetchone()
-        gpicks = c.execute(
-            "SELECT group_label, team_name FROM group_picks WHERE user_id=? ORDER BY group_label",
-            (uid,),
-        ).fetchall()
-        mpicks = c.execute(
-            "SELECT m.home, m.away, mp.pick "
-            "FROM match_predictions mp JOIN matches m ON m.match_id=mp.match_id "
-            "WHERE mp.user_id=? ORDER BY m.kickoff",
-            (uid,),
-        ).fetchall()
-    lines = [f"📋 Pronosticurile lui {u['full_name']}\n"]
-    lines.append(f"🏆 Campioană: {champ['team_name'] if champ else '—'}")
-    lines.append("\n📊 Grupe:")
-    lines += [f"  • Grupa {g['group_label']}: {g['team_name']}" for g in gpicks] or ["  —"]
-    lines.append("\n⚽️ Meciuri:")
-    if mpicks:
-        lines += [f"  • {mp['home']} vs {mp['away']}: {pick_label(mp['home'], mp['away'], mp['pick'])}" for mp in mpicks]
-    else:
-        lines.append("  —")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_matchpicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Format: /matchpicks <id_meci> (vezi /listmatches)")
-        return
-    mid = int(context.args[0])
-    with db() as c:
-        m = c.execute("SELECT * FROM matches WHERE match_id=?", (mid,)).fetchone()
-        if not m:
-            await update.message.reply_text("Meci inexistent.")
-            return
-        rows = c.execute(
-            "SELECT u.full_name, mp.pick FROM match_predictions mp "
-            "JOIN users u ON u.user_id=mp.user_id "
-            "WHERE mp.match_id=? AND u.approved=1 ORDER BY u.full_name",
-            (mid,),
-        ).fetchall()
-    lines = [f"⚽️ {m['home']} vs {m['away']} ({m['stage']}) — pronosticuri:\n"]
-    if not rows:
-        lines.append("Nimeni n-a pronosticat încă.")
-    else:
-        for r in rows:
-            lines.append(f"• {r['full_name']}: {pick_label(m['home'], m['away'], r['pick'])}")
-    if m["result"]:
-        lines.append(f"\nRezultat oficial: {pick_label(m['home'], m['away'], m['result'])}")
-    await update.message.reply_text("\n".join(lines))
-
-
-# ------------------------------------------------------------------ #
-#  COMENZI ADMIN — concurs
-# ------------------------------------------------------------------ #
-async def cmd_addmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    parts = [p.strip() for p in " ".join(context.args).split("|")]
-    if len(parts) < 3:
-        await update.message.reply_text(
-            "Format: /addmatch Echipa1 | Echipa2 | YYYY-MM-DD HH:MM | Faza\n"
-            "Ex: /addmatch Mexic | SUA | 2026-06-11 19:00 | Grupa A"
-        )
-        return
-    home, away, kickoff = parts[0], parts[1], parts[2]
-    stage = parts[3] if len(parts) > 3 else "Grupe"
-    try:
-        datetime.strptime(kickoff, "%Y-%m-%d %H:%M")
-    except ValueError:
-        await update.message.reply_text("Dată invalidă. Folosește YYYY-MM-DD HH:MM")
-        return
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO matches(home, away, kickoff, stage) VALUES(?,?,?,?)",
-            (home, away, kickoff, stage),
-        )
-        mid = cur.lastrowid
-    await update.message.reply_text(f"✅ Meci #{mid}: {home} vs {away} ({kickoff}, {stage})")
-
-
-async def cmd_setresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if len(context.args) != 2 or context.args[1].upper() not in ("HOME", "DRAW", "AWAY"):
-        await update.message.reply_text("Format: /setresult <id_meci> <HOME|DRAW|AWAY>")
-        return
-    mid, res = int(context.args[0]), context.args[1].upper()
-    with db() as c:
-        m = c.execute("SELECT * FROM matches WHERE match_id=?", (mid,)).fetchone()
-        if not m:
-            await update.message.reply_text("Meci inexistent.")
-            return
-        c.execute("UPDATE matches SET result=? WHERE match_id=?", (res, mid))
     await update.message.reply_text(
-        f"✅ Rezultat meci #{mid}: {pick_label(m['home'], m['away'], res)}. Punctajele s-au actualizat."
-    )
+        "🎁 Premii\n\n" + get_config("prizes", "Premiile vor fi anunțate de admin."))
 
 
-async def cmd_setgroupwinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+async def _require_player(update):
+    """Verifică dacă userul e aprobat + și-a terminat înscrierea pentru meciuri."""
+    uid = update.effective_user.id
+    row = db_one("SELECT approved FROM users WHERE telegram_id=?", (uid,))
+    if not row or not row["approved"]:
+        await update.message.reply_text("⏳ Trebuie să fii aprobat de admin. Scrie /start.")
+        return False
+    gp = {r["kind"] for r in
+          db_all("SELECT kind FROM global_predictions WHERE telegram_id=?", (uid,))}
+    needed = ["champion", "topscorer"] + [f"group_{L}" for L in open_groups()]
+    if any(k not in gp for k in needed):
+        await update.message.reply_text(
+            "Întâi termină pronosticurile obligatorii 👇")
+        await prompt_next(update.get_bot(), update.effective_chat.id, uid)
+        return False
+    return True
+
+
+async def show_window(update, context, win):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Scrie-mi în privat ca să pariezi 🙂")
         return
+    if not await _require_player(update):
+        return
+    uid = update.effective_user.id
+    ms, kb = kb_match_list(win, uid)
+    titlu = "📅 MECIURILE DE AZI (12:00 → 12:00)" if win == "a" \
+        else "📅 MECIURILE DE MÂINE"
+    if not ms:
+        await update.message.reply_text(titlu + "\n\nNiciun meci în acest interval.")
+        return
+    await update.message.reply_text(
+        titlu + "\n\n⚽️ = poți pronostica · 🔒 = echipe nestabilite · ⏱ = a început\n"
+        "Apasă pe un meci ca să alegi scorul (1X2 + scor exact).",
+        reply_markup=kb)
+
+
+async def cmd_azi(update, context):
+    await show_window(update, context, "a")
+
+
+async def cmd_maine(update, context):
+    await show_window(update, context, "m")
+
+
+async def cmd_grupe(update, context):
+    if update.effective_chat.type != "private":
+        return
+    uid = update.effective_user.id
+    row = db_one("SELECT approved FROM users WHERE telegram_id=?", (uid,))
+    if not row or not row["approved"]:
+        await update.message.reply_text("⏳ Trebuie să fii aprobat. Scrie /start.")
+        return
+    await prompt_next(context.bot, update.effective_chat.id, uid)
+
+
+async def cmd_pronosticurile(update, context):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Scrie-mi în privat pentru pronosticurile tale.")
+        return
+    uid = update.effective_user.id
+    row = db_one("SELECT approved FROM users WHERE telegram_id=?", (uid,))
+    if not row or not row["approved"]:
+        await update.message.reply_text("⏳ Trebuie să fii aprobat. Scrie /start.")
+        return
+    total, lines = score_user(uid)
+    out = ["🎯 PRONOSTICURILE TALE\n"]
+    out += lines if lines else ["(încă nimic ales)"]
+
+    preds = db_all("SELECT match_id, pick FROM match_predictions WHERE telegram_id=?", (uid,))
+    if preds:
+        ids = [str(p["match_id"]) for p in preds]
+        rows = db_all(f"SELECT * FROM matches WHERE id IN ({','.join('?'*len(ids))}) "
+                      "ORDER BY kickoff", ids)
+        pby = {p["match_id"]: p["pick"] for p in preds}
+        upcoming = [r for r in rows if r["kickoff"] > now_str()]
+        if upcoming:
+            out.append("\n📌 Meciuri pariate (viitoare):")
+            for r in upcoming:
+                out.append(f"• {fmt_kick(r['kickoff'])} {r['home']}–{r['away']}: "
+                           f"{pby[r['id']]}")
+    out.append(f"\n💰 TOTAL: {fmt_pts(total)}p")
+    await update.message.reply_text("\n".join(out))
+
+
+async def cmd_clasament(update, context):
+    await update.message.reply_text(render_leaderboard())
+
+
+async def cmd_id(update, context):
+    u = update.effective_user
+    await update.message.reply_text(
+        f"ID-ul tău: {u.id}\nID-ul acestui chat: {update.effective_chat.id}")
+
+
+# ==============================================================================
+#  COMENZI ADMIN
+# ==============================================================================
+
+def admin_only(func):
+    async def wrap(update, context):
+        if not is_admin(update.effective_user.id):
+            return
+        return await func(update, context)
+    return wrap
+
+
+@admin_only
+async def cmd_setgrup(update, context):
+    cid = update.effective_chat.id
+    set_config("group_chat_id", cid)
+    await update.message.reply_text(f"✅ Grup setat (ID {cid}). Aici postez la {DAILY_HOUR:02d}:00.")
+
+
+@admin_only
+async def cmd_aproba(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /aproba <id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID invalid.")
+        return
+    await approve_user(context, uid, update.message)
+
+
+async def approve_user(context, uid, reply_to=None):
+    row = db_one("SELECT * FROM users WHERE telegram_id=?", (uid,))
+    if not row:
+        if reply_to:
+            await reply_to.reply_text("Userul nu există (nu a dat /start botului).")
+        return
+    db_run("UPDATE users SET approved=1 WHERE telegram_id=?", (uid,))
+    if reply_to:
+        await reply_to.reply_text(f"✅ Aprobat: {row['full_name']}")
+    try:
+        await context.bot.send_message(uid, "🎉 Ai fost aprobat! Hai să începem 👇")
+        await context.bot.send_message(uid, WELCOME)
+        await prompt_next(context.bot, uid, uid)
+    except Exception as e:
+        log.warning("Nu pot scrie userului %s: %s", uid, e)
+
+
+@admin_only
+async def cmd_resping(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /resping <id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        return
+    db_run("DELETE FROM users WHERE telegram_id=?", (uid,))
+    db_run("DELETE FROM global_predictions WHERE telegram_id=?", (uid,))
+    db_run("DELETE FROM match_predictions WHERE telegram_id=?", (uid,))
+    await update.message.reply_text("Participant scos.")
+
+
+@admin_only
+async def cmd_useri(update, context):
+    rows = db_all("SELECT telegram_id, full_name, username, approved FROM users ORDER BY approved DESC, full_name")
+    if not rows:
+        await update.message.reply_text("Niciun participant.")
+        return
+    out = ["👥 PARTICIPANȚI\n"]
+    for r in rows:
+        st = "✅" if r["approved"] else "⏳"
+        un = f"@{r['username']}" if r["username"] else ""
+        out.append(f"{st} {r['full_name']} {un} — ID {r['telegram_id']}")
+    await update.message.reply_text("\n".join(out))
+
+
+@admin_only
+async def cmd_scor(update, context):
     if len(context.args) < 2:
-        await update.message.reply_text("Format: /setgroupwinner <Grupa> <Echipa>")
+        await update.message.reply_text("Folosire: /scor <id_meci> 2-1")
         return
-    label = context.args[0].upper()
-    team = " ".join(context.args[1:])
-    with db() as c:
-        c.execute(
-            "INSERT INTO group_results(group_label, winner_team) VALUES(?,?) "
-            "ON CONFLICT(group_label) DO UPDATE SET winner_team=excluded.winner_team",
-            (label, team),
-        )
-    await update.message.reply_text(f"✅ Câștigătoarea grupei {label}: {team}")
+    try:
+        mid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID meci invalid.")
+        return
+    sc = parse_score(" ".join(context.args[1:]))
+    if not sc:
+        await update.message.reply_text("Scor invalid. Ex: /scor 5 2-1")
+        return
+    m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
+    if not m:
+        await update.message.reply_text("Nu există meciul cu acest ID. Vezi /lista")
+        return
+    db_run("UPDATE matches SET result_home=?, result_away=?, finished=1 WHERE id=?",
+           (sc[0], sc[1], mid))
+    await update.message.reply_text(
+        f"✅ Rezultat salvat: {m['home']} {sc[0]}-{sc[1]} {m['away']}\n"
+        "Punctele se actualizează automat la /clasament.")
 
 
-async def cmd_setchampion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
+@admin_only
+async def cmd_anuleaza_scor(update, context):
     if not context.args:
-        await update.message.reply_text("Format: /setchampion <Echipa>")
+        await update.message.reply_text("Folosire: /anuleaza_scor <id>")
         return
-    set_config("champion_winner", " ".join(context.args))
-    await update.message.reply_text(f"✅ Campioana turneului: {' '.join(context.args)}. Punctaje actualizate.")
+    try:
+        mid = int(context.args[0])
+    except ValueError:
+        return
+    db_run("UPDATE matches SET result_home=NULL, result_away=NULL, finished=0 WHERE id=?", (mid,))
+    await update.message.reply_text("Rezultat șters.")
 
 
-async def cmd_setpot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+@admin_only
+async def cmd_grupa(update, context):
+    if len(context.args) < 2:
+        await update.message.reply_text("Folosire: /grupa A Mexic")
         return
+    letter = context.args[0].upper()
+    if letter not in GROUPS:
+        await update.message.reply_text("Grupă inexistentă (A–L).")
+        return
+    team = find_team(" ".join(context.args[1:]), GROUPS[letter])
+    if not team:
+        await update.message.reply_text(
+            "Echipă negăsită. Opțiuni: " + ", ".join(GROUPS[letter]))
+        return
+    set_result(f"group_{letter}", team)
+    await update.message.reply_text(f"✅ Câștigătoarea Grupei {letter}: {team}")
+
+
+@admin_only
+async def cmd_campioana(update, context):
     if not context.args:
-        await update.message.reply_text("Format: /setpot <suma> [moneda]\nEx: /setpot 50 RON")
+        await update.message.reply_text("Folosire: /campioana Spania")
         return
-    set_config("pot_per_person", context.args[0])
-    if len(context.args) > 1:
-        set_config("currency", context.args[1])
-    await update.message.reply_text("✅ Cotizație setată. Vezi /premii")
+    team = find_team(" ".join(context.args), ALL_TEAMS)
+    if not team:
+        await update.message.reply_text("Echipă negăsită. Scrie numele exact.")
+        return
+    set_result("champion", team)
+    await update.message.reply_text(f"✅ Campioana mondială: {team}")
 
 
-async def cmd_setdeadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+@admin_only
+async def cmd_golgheter(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /golgheter Mbappe  (sau /golgheter ALTUL)")
         return
     raw = " ".join(context.args)
+    if norm(raw) == "altul":
+        set_result("topscorer", "ALTUL")
+        await update.message.reply_text("✅ Golgheter setat: ALTUL (cineva din afara listei).")
+        return
+    player = find_player(raw)
+    value = player or raw
+    set_result("topscorer", value)
+    extra = "" if player else " (⚠️ nu e în listă — câștigă cei cu 'ALTUL')"
+    await update.message.reply_text(f"✅ Golgheter: {value}{extra}")
+
+
+def set_result(kind, value):
+    db_run("INSERT OR REPLACE INTO results(kind,value) VALUES(?,?)", (kind, value))
+
+
+@admin_only
+async def cmd_lista(update, context):
+    rows = db_all("SELECT * FROM matches ORDER BY kickoff")
+    out = ["📋 MECIURI (ID · oră · meci · rezultat)\n"]
+    for m in rows:
+        res = ""
+        if m["finished"] and m["result_home"] is not None:
+            res = f" [{m['result_home']}-{m['result_away']}]"
+        lock = "" if m["teams_known"] else " 🔒"
+        out.append(f"{m['id']}: {fmt_kick(m['kickoff'])} {m['home']}–{m['away']}{res}{lock}")
+    text = "\n".join(out)
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
+
+
+@admin_only
+async def cmd_echipe(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /echipe <id> Brazilia - Spania")
+        return
     try:
-        datetime.strptime(raw, "%Y-%m-%d %H:%M")
+        mid = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Format: /setdeadline YYYY-MM-DD HH:MM")
+        await update.message.reply_text("ID invalid.")
         return
-    set_config("picks_deadline", raw)
-    await update.message.reply_text(f"✅ Termen pronosticuri (campioană+grupe): {raw}")
-
-
-async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+    rest = " ".join(context.args[1:])
+    sep = " - " if " - " in rest else (" vs " if " vs " in rest else None)
+    if not sep:
+        await update.message.reply_text("Format: /echipe 90 Brazilia - Spania")
         return
-    set_config("contest_chat", update.effective_chat.id)
-    await update.message.reply_text("✅ Acest chat este acum grupul oficial al concursului.")
+    home, away = [x.strip() for x in rest.split(sep, 1)]
+    db_run("UPDATE matches SET home=?, away=?, teams_known=1 WHERE id=?", (home, away, mid))
+    await update.message.reply_text(f"✅ Meci {mid}: {home} – {away} (deschis la pariuri)")
 
 
-async def cmd_listmatches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
+@admin_only
+async def cmd_ora(update, context):
+    if len(context.args) < 3:
+        await update.message.reply_text("Folosire: /ora <id> 2026-07-09 23:00")
         return
-    with db() as c:
-        ms = c.execute("SELECT * FROM matches ORDER BY kickoff").fetchall()
-    if not ms:
-        await update.message.reply_text("Niciun meci adăugat.")
+    try:
+        mid = int(context.args[0])
+        ko = f"{context.args[1]} {context.args[2]}"
+        datetime.strptime(ko, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text("Dată invalidă. Format: 2026-07-09 23:00")
         return
-    lines = [
-        f"#{m['match_id']} {m['kickoff']} {m['home']} vs {m['away']} "
-        f"[{m['stage']}] {('-> ' + m['result']) if m['result'] else ''}"
-        for m in ms
-    ]
-    await update.message.reply_text("\n".join(lines))
+    db_run("UPDATE matches SET kickoff=? WHERE id=?", (ko, mid))
+    await update.message.reply_text(f"✅ Ora meciului {mid}: {fmt_kick(ko)}")
 
 
-async def cmd_announcetomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    await job_daily_matches(context)
-    await update.message.reply_text("✅ Trimis.")
+def _split_pipe(text, command):
+    payload = text.split(maxsplit=1)
+    if len(payload) < 2:
+        return None
+    return [p.strip() for p in payload[1].split("|")]
 
 
-async def cmd_postleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    chat = get_config("contest_chat")
-    if chat:
-        await context.bot.send_message(chat_id=int(chat), text=leaderboard_text())
-    else:
-        await update.message.reply_text(leaderboard_text())
-
-
-# ------------------------------------------------------------------ #
-#  COMENZI ADMIN — resetare
-# ------------------------------------------------------------------ #
-async def cmd_reset_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if not (context.args and context.args[0] == "CONFIRM"):
+@admin_only
+async def cmd_amical(update, context):
+    parts = _split_pipe(update.message.text, "amical")
+    if not parts or len(parts) < 3:
         await update.message.reply_text(
-            "⚠️ /reset_game șterge toate PRONOSTICURILE și REZULTATELE, dar păstrează "
-            "jucătorii, meciurile și setările.\n\nCa să confirmi:\n/reset_game CONFIRM"
-        )
+            "Folosire: /amical Italia | Brazilia | 2026-06-06 21:00")
         return
-    with db() as c:
-        for t in ("match_predictions", "group_picks", "champion_picks", "group_results"):
-            c.execute(f"DELETE FROM {t}")
-        c.execute("UPDATE matches SET result=NULL")
-        c.execute("DELETE FROM config WHERE key='champion_winner'")
-    await update.message.reply_text(
-        "🧹 Gata. Pronosticurile și rezultatele au fost șterse.\n"
-        "Meciurile, echipele, jucătorii și setările au rămas."
-    )
+    home, away, ko = parts[0], parts[1], parts[2]
+    try:
+        datetime.strptime(ko, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text("Dată invalidă. Format: 2026-06-06 21:00")
+        return
+    db_run("""INSERT INTO matches(stage,grp,home,away,kickoff,venue,teams_known,note)
+              VALUES('amical',NULL,?,?,?,'Amical',1,'AMICAL')""", (home, away, ko))
+    await update.message.reply_text(f"✅ Amical adăugat: {home} – {away} ({fmt_kick(ko)})")
 
 
-async def cmd_reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if not (context.args and context.args[0] == "CONFIRM"):
+@admin_only
+async def cmd_adauga_meci(update, context):
+    parts = _split_pipe(update.message.text, "adauga_meci")
+    if not parts or len(parts) < 5:
         await update.message.reply_text(
-            "⚠️ /reset_all șterge TOT: jucători, pronosticuri, meciuri, rezultate și setări, "
-            "și reîncarcă echipele implicite (resetare de fabrică).\n\nCa să confirmi:\n/reset_all CONFIRM"
-        )
+            "Folosire:\n/adauga_meci grupe | A | Mexic | Cehia | 2026-06-11 22:00 | Mexico\n"
+            "(grupa și locul pot fi '-')")
         return
-    with db() as c:
-        for t in ("users", "match_predictions", "group_picks", "champion_picks",
-                  "matches", "group_results", "config", "teams"):
-            c.execute(f"DELETE FROM {t}")
-    init_db()  # reîncarcă echipele implicite
-    await update.message.reply_text(
-        "🧹 Resetare totală făcută.\n"
-        "Acum: setează din nou /setchat, /setpot, /setdeadline și (dacă e cazul) echipele reale. "
-        "Participanții trebuie să dea din nou /start și să fie aprobați."
-    )
-
-
-# ------------------------------------------------------------------ #
-#  JOB-URI PROGRAMATE
-# ------------------------------------------------------------------ #
-async def job_daily_matches(context: ContextTypes.DEFAULT_TYPE):
-    tomorrow = (now_local() + timedelta(days=1)).strftime("%Y-%m-%d")
-    matches = matches_on(tomorrow)
-    if not matches:
+    stage = parts[0] or "grupe"
+    grp = None if parts[1] in ("", "-") else parts[1].upper()
+    home, away, ko = parts[2], parts[3], parts[4]
+    venue = parts[5] if len(parts) > 5 and parts[5] not in ("", "-") else ""
+    try:
+        datetime.strptime(ko, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text("Dată invalidă. Format: 2026-06-11 22:00")
         return
-    header = "📅 *Meciurile de MÂINE* (pronostichează până la startul fiecăruia):\n\n" + \
-        "\n\n".join(match_text(m) for m in matches)
-
-    chat = get_config("contest_chat")
-    if chat:
-        try:
-            await context.bot.send_message(chat_id=int(chat), text=header, parse_mode="Markdown")
-        except Exception as e:
-            log.warning("Nu am putut posta în grup: %s", e)
-
-    with db() as c:
-        users = c.execute("SELECT user_id FROM users WHERE approved=1").fetchall()
-    for u in users:
-        try:
-            await context.bot.send_message(chat_id=u["user_id"], text="📅 Meciurile de mâine — pronostichează:")
-            for m in matches:
-                await send_match_prompt(context.bot, u["user_id"], m, u["user_id"])
-        except Exception as e:
-            log.info("Nu pot trimite către %s: %s", u["user_id"], e)
+    db_run("""INSERT INTO matches(stage,grp,home,away,kickoff,venue,teams_known,note)
+              VALUES(?,?,?,?,?,?,1,'')""", (stage, grp, home, away, ko, venue))
+    await update.message.reply_text(f"✅ Meci adăugat: {home} – {away} ({fmt_kick(ko)})")
 
 
-async def job_leaderboard(context: ContextTypes.DEFAULT_TYPE):
-    text = "🌙 Clasamentul zilei\n\n" + leaderboard_text()
-    chat = get_config("contest_chat")
-    if chat:
+@admin_only
+async def cmd_sterge_meci(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /sterge_meci <id>")
+        return
+    try:
+        mid = int(context.args[0])
+    except ValueError:
+        return
+    db_run("DELETE FROM matches WHERE id=?", (mid,))
+    db_run("DELETE FROM match_predictions WHERE match_id=?", (mid,))
+    await update.message.reply_text("Meci șters.")
+
+
+@admin_only
+async def cmd_deschide_grupa(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /deschide_grupa C")
+        return
+    L = context.args[0].upper()
+    if L not in GROUPS:
+        await update.message.reply_text("Grupă inexistentă (A–L).")
+        return
+    og = open_groups()
+    if L in og:
+        await update.message.reply_text(f"Grupa {L} e deja deschisă.")
+        return
+    og.append(L)
+    set_config("open_groups", ",".join(og))
+    await update.message.reply_text(f"✅ Grupa {L} deschisă la vot.")
+    # anunță participanții
+    for u in db_all("SELECT telegram_id FROM users WHERE approved=1"):
         try:
-            await context.bot.send_message(chat_id=int(chat), text=text)
-            return
-        except Exception as e:
-            log.warning("Nu am putut posta clasamentul: %s", e)
-    with db() as c:
-        users = c.execute("SELECT user_id FROM users WHERE approved=1").fetchall()
-    for u in users:
-        try:
-            await context.bot.send_message(chat_id=u["user_id"], text=text)
+            await context.bot.send_message(
+                u["telegram_id"],
+                f"🆕 S-a deschis Grupa {L} la vot! Scrie /grupe ca să alegi câștigătoarea.")
         except Exception:
             pass
 
 
-# ------------------------------------------------------------------ #
-#  PORNIRE
-# ------------------------------------------------------------------ #
-async def post_init(app: Application):
-    init_db()
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "Înscriere și instrucțiuni"),
-            BotCommand("campioana", "Alege campioana turneului"),
-            BotCommand("grupe", "Alege câștigătoarele de grupă"),
-            BotCommand("azi", "Meciurile de azi"),
-            BotCommand("maine", "Meciurile de mâine"),
-            BotCommand("pronosticurile", "Pronosticurile tale"),
-            BotCommand("clasament", "Clasamentul"),
-            BotCommand("premii", "Premiile"),
-            BotCommand("ajutor", "Ajutor"),
-        ]
-    )
-    app.job_queue.run_daily(job_daily_matches, time=dtime(DAILY_HOUR, 0, tzinfo=TZ))
-    app.job_queue.run_daily(job_leaderboard, time=dtime(LB_HOUR, LB_MIN, tzinfo=TZ))
-    log.info("Bot pornit. Meciuri de mâine la %02d:00, clasament la %02d:%02d.", DAILY_HOUR, LB_HOUR, LB_MIN)
+@admin_only
+async def cmd_premii_set(update, context):
+    payload = update.message.text.split(maxsplit=1)
+    if len(payload) < 2:
+        await update.message.reply_text("Folosire: /premii_set <text>")
+        return
+    set_config("prizes", payload[1])
+    await update.message.reply_text("✅ Premii actualizate.")
 
+
+@admin_only
+async def cmd_anunt(update, context):
+    payload = update.message.text.split(maxsplit=1)
+    if len(payload) < 2:
+        await update.message.reply_text("Folosire: /anunt <text>")
+        return
+    msg = payload[1]
+    n = 0
+    for u in db_all("SELECT telegram_id FROM users WHERE approved=1"):
+        try:
+            await context.bot.send_message(u["telegram_id"], "📢 " + msg)
+            n += 1
+        except Exception:
+            pass
+    await update.message.reply_text(f"Trimis la {n} participanți.")
+
+
+@admin_only
+async def cmd_bonus(update, context):
+    """ BACKUP: adaugă/scade puncte manual. /bonus <id sau @user> 3 motiv """
+    if len(context.args) < 2:
+        await update.message.reply_text("Folosire: /bonus <id sau @user> 3 motiv\n"
+                                        "(poți pune și -3 ca să scazi)")
+        return
+    target = context.args[0]
+    uid = None
+    if target.startswith("@"):
+        row = db_one("SELECT telegram_id FROM users WHERE LOWER(username)=?",
+                     (target[1:].lower(),))
+        uid = row["telegram_id"] if row else None
+    else:
+        try:
+            uid = int(target)
+        except ValueError:
+            uid = None
+    if uid is None:
+        await update.message.reply_text("Participant negăsit. Folosește ID-ul (vezi /useri).")
+        return
+    try:
+        pts = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Puncte invalide.")
+        return
+    reason = " ".join(context.args[2:]) or "bonus admin"
+    db_run("INSERT INTO bonus(telegram_id,points,reason,created_at) VALUES(?,?,?,?)",
+           (uid, pts, reason, now_str()))
+    await update.message.reply_text(
+        f"✅ {'+' if pts >= 0 else ''}{fmt_pts(pts)}p pentru ID {uid} ({reason}).")
+
+
+@admin_only
+async def cmd_reset_pronosticuri(update, context):
+    db_run("DELETE FROM match_predictions")
+    await update.message.reply_text("✅ Toate pronosticurile pe meciuri au fost șterse.")
+
+
+@admin_only
+async def cmd_reset_rezultate(update, context):
+    db_run("DELETE FROM results")
+    db_run("UPDATE matches SET result_home=NULL, result_away=NULL, finished=0")
+    await update.message.reply_text("✅ Toate rezultatele au fost șterse.")
+
+
+@admin_only
+async def cmd_reset_tot(update, context):
+    db_run("DELETE FROM match_predictions")
+    db_run("DELETE FROM global_predictions")
+    db_run("DELETE FROM results")
+    db_run("DELETE FROM bonus")
+    db_run("UPDATE matches SET result_home=NULL, result_away=NULL, finished=0")
+    set_config("open_groups", "A,B")
+    await update.message.reply_text(
+        "✅ Resetat TOT (pronosticuri, rezultate, bonus). Participanții AU RĂMAS — "
+        "nu trebuie să intre din nou. Pot reîncepe cu /start.")
+
+
+# ==============================================================================
+#  CALLBACK-uri (butoane)
+# ==============================================================================
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    uid = q.from_user.id
+
+    if data == "noop":
+        await q.answer()
+        return
+
+    # --- admin aprobă / respinge ---
+    if data.startswith("adm:"):
+        if not is_admin(uid):
+            await q.answer("Doar adminul.", show_alert=True)
+            return
+        _, action, target = data.split(":")
+        target = int(target)
+        if action == "ok":
+            await q.answer("Aprobat ✅")
+            await q.edit_message_text(q.message.text + "\n\n✅ APROBAT")
+            await approve_user(context, target)
+        else:
+            await q.answer("Respins ❌")
+            db_run("DELETE FROM users WHERE telegram_id=?", (target,))
+            await q.edit_message_text(q.message.text + "\n\n❌ RESPINS")
+        return
+
+    # --- campioana ---
+    if data.startswith("champ:"):
+        if db_one("SELECT 1 FROM global_predictions WHERE telegram_id=? AND kind='champion'", (uid,)):
+            await q.answer("Ai ales deja, nu se mai poate schimba.", show_alert=True)
+            return
+        team = ALL_TEAMS[int(data.split(":")[1])]
+        db_run("INSERT OR REPLACE INTO global_predictions VALUES(?,?,?)", (uid, "champion", team))
+        await q.answer("Campioana aleasă ✅")
+        await q.edit_message_text(f"1️⃣ Campioana ta: {team} ✅ (blocată)")
+        await prompt_next(context.bot, q.message.chat_id, uid)
+        return
+
+    # --- golgheter ---
+    if data == "ts:search":
+        context.user_data["await"] = "ts_search"
+        await q.answer()
+        await q.edit_message_text("🔍 Scrie numele jucătorului (ex: salah):")
+        return
+    if data == "ts:other":
+        if db_one("SELECT 1 FROM global_predictions WHERE telegram_id=? AND kind='topscorer'", (uid,)):
+            await q.answer("Ai ales deja.", show_alert=True)
+            return
+        db_run("INSERT OR REPLACE INTO global_predictions VALUES(?,?,?)", (uid, "topscorer", "ALTUL"))
+        context.user_data.pop("await", None)
+        await q.answer("Ales: ALTUL ✅")
+        await q.edit_message_text("2️⃣ Golgheterul tău: ALTUL ✅ (blocat)")
+        await prompt_next(context.bot, q.message.chat_id, uid)
+        return
+    if data.startswith("ts:"):
+        if db_one("SELECT 1 FROM global_predictions WHERE telegram_id=? AND kind='topscorer'", (uid,)):
+            await q.answer("Ai ales deja.", show_alert=True)
+            return
+        player = TS_NAMES[int(data.split(":")[1])]
+        db_run("INSERT OR REPLACE INTO global_predictions VALUES(?,?,?)", (uid, "topscorer", player))
+        context.user_data.pop("await", None)
+        await q.answer("Golgheter ales ✅")
+        await q.edit_message_text(f"2️⃣ Golgheterul tău: {player} ✅ (blocat)")
+        await prompt_next(context.bot, q.message.chat_id, uid)
+        return
+
+    # --- câștigătoare grupă ---
+    if data.startswith("grp:"):
+        _, letter, idx = data.split(":")
+        kind = f"group_{letter}"
+        if db_one("SELECT 1 FROM global_predictions WHERE telegram_id=? AND kind=?", (uid, kind)):
+            await q.answer("Ai ales deja pentru această grupă.", show_alert=True)
+            return
+        team = GROUPS[letter][int(idx)]
+        db_run("INSERT OR REPLACE INTO global_predictions VALUES(?,?,?)", (uid, kind, team))
+        await q.answer("Ales ✅")
+        await q.edit_message_text(f"Grupa {letter} — alegerea ta: {team} ✅ (blocată)")
+        await prompt_next(context.bot, q.message.chat_id, uid)
+        return
+
+    # --- deschide tastatura de scor pt un meci ---
+    if data.startswith("po:"):
+        _, win, mid = data.split(":")
+        mid = int(mid)
+        m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
+        if not m:
+            await q.answer("Meci inexistent.", show_alert=True)
+            return
+        if not m["teams_known"]:
+            await q.answer("Echipele nu sunt încă stabilite.", show_alert=True)
+            return
+        if m["kickoff"] <= now_str():
+            await q.answer("Meciul a început, nu mai poți pronostica.", show_alert=True)
+            return
+        pred = db_one("SELECT pick FROM match_predictions WHERE telegram_id=? AND match_id=?",
+                      (uid, mid))
+        cur = f"\nPronosticul tău acum: {pred['pick']}" if pred else ""
+        await q.answer()
+        await q.edit_message_text(
+            f"⚽️ {m['home']} – {m['away']}\n{fmt_kick(m['kickoff'])} · {m['venue']}{cur}\n\n"
+            "Alege rezultatul (1X2) sau scorul exact (+2p):",
+            reply_markup=kb_match_scores(win, mid))
+        return
+
+    # --- salvează pronosticul ---
+    if data.startswith("sp:"):
+        _, win, mid, pick = data.split(":", 3)
+        mid = int(mid)
+        m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
+        if not m or not m["teams_known"]:
+            await q.answer("Indisponibil.", show_alert=True)
+            return
+        if m["kickoff"] <= now_str():
+            await q.answer("Meciul a început.", show_alert=True)
+            return
+        if pick == "alt":
+            context.user_data["await"] = f"score:{mid}:{win}"
+            await q.answer()
+            await q.edit_message_text(
+                f"✏️ {m['home']} – {m['away']}\nScrie scorul (ex: 4-2):")
+            return
+        db_run("INSERT OR REPLACE INTO match_predictions(telegram_id,match_id,pick) VALUES(?,?,?)",
+               (uid, mid, pick))
+        await q.answer(f"Salvat: {pick} ✅", show_alert=False)
+        ms, kb = kb_match_list(win, uid)
+        try:
+            await q.edit_message_text(
+                "✅ Pronostic salvat. Poți schimba până începe meciul.\n\n"
+                "Apasă alt meci sau /pronosticurile.", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    # --- înapoi la lista de meciuri ---
+    if data.startswith("bl:"):
+        win = data.split(":")[1]
+        ms, kb = kb_match_list(win, uid)
+        await q.answer()
+        titlu = "📅 MECIURILE DE AZI" if win == "a" else "📅 MECIURILE DE MÂINE"
+        await q.edit_message_text(titlu + "\n\nApasă pe un meci ca să pronostichezi.",
+                                  reply_markup=kb)
+        return
+
+    await q.answer()
+
+
+# ==============================================================================
+#  TEXT LIBER (căutare golgheter / scor custom)
+# ==============================================================================
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("await")
+    if not state:
+        await update.message.reply_text("Folosește meniul de comenzi. /ajutor")
+        return
+    uid = update.effective_user.id
+    text = update.message.text.strip()
+
+    if state == "ts_search":
+        found = [n for n in TS_NAMES if norm(text) in norm(n)]
+        context.user_data.pop("await", None)
+        if not found:
+            await update.message.reply_text(
+                f"Niciun jucător găsit pentru '{text}'.",
+                reply_markup=kb_topscorers_search([]))
+        else:
+            await update.message.reply_text(
+                f"Rezultate pentru '{text}':", reply_markup=kb_topscorers_search(found))
+        return
+
+    if state.startswith("score:"):
+        _, mid, win = state.split(":")
+        mid = int(mid)
+        sc = parse_score(text)
+        if not sc:
+            await update.message.reply_text("Scor invalid. Scrie ceva de forma 4-2:")
+            return
+        m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
+        if not m or m["kickoff"] <= now_str():
+            context.user_data.pop("await", None)
+            await update.message.reply_text("Meciul nu mai e disponibil.")
+            return
+        pick = f"{sc[0]}-{sc[1]}"
+        db_run("INSERT OR REPLACE INTO match_predictions(telegram_id,match_id,pick) VALUES(?,?,?)",
+               (uid, mid, pick))
+        context.user_data.pop("await", None)
+        await update.message.reply_text(
+            f"✅ Pronostic salvat: {m['home']} {pick} {m['away']}.\n"
+            "Mai vezi meciuri cu /azi sau /maine.")
+        return
+
+
+# ==============================================================================
+#  MEMBRII NOI ÎN GRUP
+# ==============================================================================
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = await context.bot.get_me()
+    for member in update.message.new_chat_members:
+        if member.id == me.id:
+            continue
+        await update.message.reply_text(
+            f"👋 Bun venit, {member.full_name}!\n"
+            f"Ca să intri în concurs, scrie-mi în privat: @{me.username} și apasă START. "
+            "Apoi adminul te aprobă.")
+
+
+# ==============================================================================
+#  POSTARE ZILNICĂ LA 12:00
+# ==============================================================================
+
+async def daily_post(context: ContextTypes.DEFAULT_TYPE):
+    gid = get_config("group_chat_id")
+    if not gid:
+        log.warning("group_chat_id nesetat — rulează /setgrup în grup.")
+        return
+    gid = int(gid)
+    start, end = current_window()
+    ms = matches_in(start, end)
+
+    lines = [f"📅 MECIURILE ZILEI ({start.strftime('%d.%m')} {DAILY_HOUR:02d}:00 → "
+             f"{end.strftime('%d.%m')} {DAILY_HOUR:02d}:00)\n"]
+    if ms:
+        for m in ms:
+            res = ""
+            if m["finished"] and m["result_home"] is not None:
+                res = f"  [{m['result_home']}-{m['result_away']}]"
+            tag = m["grp"] and f"Gr. {m['grp']}" or m["note"]
+            lines.append(f"• {fmt_kick(m['kickoff'])} ({tag}) {m['home']} – {m['away']}{res}")
+    else:
+        lines.append("Niciun meci azi.")
+    lines.append("\n👉 Pariați în privat la bot: /azi")
+
+    try:
+        await context.bot.send_message(gid, "\n".join(lines))
+        await context.bot.send_message(gid, render_leaderboard())
+    except Exception as e:
+        log.warning("Eroare la postarea zilnică: %s", e)
+
+
+# ==============================================================================
+#  ERORI
+# ==============================================================================
+
+async def on_error(update, context):
+    log.error("Eroare: %s", context.error)
+
+
+# ==============================================================================
+#  MAIN
+# ==============================================================================
 
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit("Lipsește BOT_TOKEN. Setează variabila de mediu BOT_TOKEN.")
-    if not ADMIN_IDS:
-        log.warning("ADMIN_IDS nu este setat — comenzile de admin nu vor funcționa.")
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Participanți
+    # utilizator
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler(["ajutor", "help"], cmd_help))
-    app.add_handler(CommandHandler("campioana", cmd_campioana))
-    app.add_handler(CommandHandler("grupe", cmd_grupe))
+    app.add_handler(CommandHandler("ajutor", cmd_ajutor))
+    app.add_handler(CommandHandler("help", cmd_ajutor))
     app.add_handler(CommandHandler("azi", cmd_azi))
     app.add_handler(CommandHandler("maine", cmd_maine))
+    app.add_handler(CommandHandler("grupe", cmd_grupe))
     app.add_handler(CommandHandler("pronosticurile", cmd_pronosticurile))
     app.add_handler(CommandHandler("clasament", cmd_clasament))
     app.add_handler(CommandHandler("premii", cmd_premii))
+    app.add_handler(CommandHandler("id", cmd_id))
 
-    # Admin — aprobare
-    app.add_handler(CommandHandler("pending", cmd_pending))
-    app.add_handler(CommandHandler("approve", cmd_approve))
-    app.add_handler(CommandHandler("deny", cmd_deny))
-    app.add_handler(CommandHandler("participanti", cmd_participanti))
-    app.add_handler(CommandHandler("allpicks", cmd_allpicks))
-    app.add_handler(CommandHandler("picks", cmd_picks))
-    app.add_handler(CommandHandler("matchpicks", cmd_matchpicks))
+    # admin
+    app.add_handler(CommandHandler("setgrup", cmd_setgrup))
+    app.add_handler(CommandHandler("aproba", cmd_aproba))
+    app.add_handler(CommandHandler("resping", cmd_resping))
+    app.add_handler(CommandHandler("useri", cmd_useri))
+    app.add_handler(CommandHandler("scor", cmd_scor))
+    app.add_handler(CommandHandler("anuleaza_scor", cmd_anuleaza_scor))
+    app.add_handler(CommandHandler("grupa", cmd_grupa))
+    app.add_handler(CommandHandler("campioana", cmd_campioana))
+    app.add_handler(CommandHandler("golgheter", cmd_golgheter))
+    app.add_handler(CommandHandler("lista", cmd_lista))
+    app.add_handler(CommandHandler("echipe", cmd_echipe))
+    app.add_handler(CommandHandler("ora", cmd_ora))
+    app.add_handler(CommandHandler("amical", cmd_amical))
+    app.add_handler(CommandHandler("adauga_meci", cmd_adauga_meci))
+    app.add_handler(CommandHandler("sterge_meci", cmd_sterge_meci))
+    app.add_handler(CommandHandler("deschide_grupa", cmd_deschide_grupa))
+    app.add_handler(CommandHandler("premii_set", cmd_premii_set))
+    app.add_handler(CommandHandler("anunt", cmd_anunt))
+    app.add_handler(CommandHandler("bonus", cmd_bonus))
+    app.add_handler(CommandHandler("reset_pronosticuri", cmd_reset_pronosticuri))
+    app.add_handler(CommandHandler("reset_rezultate", cmd_reset_rezultate))
+    app.add_handler(CommandHandler("reset_tot", cmd_reset_tot))
 
-    # Admin — concurs
-    app.add_handler(CommandHandler("addmatch", cmd_addmatch))
-    app.add_handler(CommandHandler("setresult", cmd_setresult))
-    app.add_handler(CommandHandler("setgroupwinner", cmd_setgroupwinner))
-    app.add_handler(CommandHandler("setchampion", cmd_setchampion))
-    app.add_handler(CommandHandler("setpot", cmd_setpot))
-    app.add_handler(CommandHandler("setdeadline", cmd_setdeadline))
-    app.add_handler(CommandHandler("setchat", cmd_setchat))
-    app.add_handler(CommandHandler("listmatches", cmd_listmatches))
-    app.add_handler(CommandHandler("announcetomorrow", cmd_announcetomorrow))
-    app.add_handler(CommandHandler("postleaderboard", cmd_postleaderboard))
+    # butoane + text + membri noi
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
 
-    # Admin — resetare
-    app.add_handler(CommandHandler("reset_game", cmd_reset_game))
-    app.add_handler(CommandHandler("reset_all", cmd_reset_all))
+    app.add_error_handler(on_error)
 
-    # Butoane
-    app.add_handler(CallbackQueryHandler(cb_champ, pattern=r"^champ:"))
-    app.add_handler(CallbackQueryHandler(cb_grp, pattern=r"^grp:"))
-    app.add_handler(CallbackQueryHandler(cb_match, pattern=r"^m:"))
+    # postare zilnică la 12:00
+    app.job_queue.run_daily(
+        daily_post, time=dt_time(hour=DAILY_HOUR, minute=DAILY_MINUTE, tzinfo=TZ))
 
+    log.info("Botul pornește...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
