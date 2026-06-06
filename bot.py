@@ -389,20 +389,25 @@ def db_one(query, params=()):
 
 
 def init_db():
-    # Config table prima, ca să putem reseta flag-ul de seed dacă reparăm schema.
+    # Config table prima (o folosim pentru flag-uri).
     db_run("""CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT)""")
 
-    # AUTO-REPARARE: dacă pe Volume a rămas un tabel "matches" vechi (de la botul anterior)
-    # cu altă structură, îl recreăm curat — altfel crapă la pornire ("no column named grp").
-    info = db_all("PRAGMA table_info(matches)")
-    if info:
-        cols = {row["name"] for row in info}
-        expected = {"id", "stage", "grp", "home", "away", "kickoff", "venue",
-                    "teams_known", "note", "result_home", "result_away", "finished"}
-        if not expected.issubset(cols):
-            log.warning("Tabel 'matches' vechi/incompatibil pe Volume — îl recreez curat.")
-            db_run("DROP TABLE matches")
-            db_run("DELETE FROM config WHERE key='seeded'")
+    # AUTO-REPARARE: pe Volume pot rămâne tabele vechi de la botul anterior, cu altă
+    # structură. Le recreăm curat ca să nu crape comenzile ("no column named ...").
+    EXPECTED = {
+        "users": {"telegram_id", "username", "full_name", "approved", "joined_at"},
+        "global_predictions": {"telegram_id", "kind", "value"},
+        "matches": {"id", "stage", "grp", "home", "away", "kickoff", "venue",
+                    "teams_known", "note", "result_home", "result_away", "finished"},
+        "match_predictions": {"telegram_id", "match_id", "pick"},
+        "results": {"kind", "value"},
+        "bonus": {"id", "telegram_id", "points", "reason", "created_at"},
+    }
+    for tname, expected in EXPECTED.items():
+        info = db_all(f"PRAGMA table_info({tname})")
+        if info and not expected.issubset({r["name"] for r in info}):
+            log.warning("Tabel '%s' vechi/incompatibil pe Volume — îl recreez curat.", tname)
+            db_run(f"DROP TABLE {tname}")
 
     db_run("""CREATE TABLE IF NOT EXISTS users(
         telegram_id INTEGER PRIMARY KEY,
@@ -424,7 +429,8 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER, points REAL, reason TEXT, created_at TEXT)""")
 
-    if get_config("seeded") != "1":
+    # Seed meciuri dacă tabelul e gol (sigur și după o reparare).
+    if db_one("SELECT COUNT(*) c FROM matches")["c"] == 0:
         for m in SEED_MATCHES:
             db_run("""INSERT INTO matches(stage,grp,home,away,kickoff,venue,teams_known,note)
                       VALUES(?,?,?,?,?,?,?,?)""", m)
