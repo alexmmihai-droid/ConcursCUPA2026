@@ -339,15 +339,14 @@ SEED_MATCHES = [
 ]
 
 # Butoane de scor pentru un meci (1X2 + scoruri uzuale + alt scor)
-SCORE_ROWS = [
-    ["1", "X", "2"],
-    ["0-0", "1-0", "0-1"],
-    ["1-1", "2-1", "1-2"],
-    ["2-2", "2-0", "0-2"],
-    ["3-3", "3-2", "2-3"],
-    ["3-0", "0-3", "3-1"],
-    ["1-3", "✏️ Alt scor"],
-]
+OUTCOME_LABEL = {"1": "gazda", "X": "Egal", "2": "oaspete"}
+
+# Scoruri uzuale pentru fiecare rezultat (pasul 2, după ce ai ales 1/X/2).
+SCORE_BY_OUTCOME = {
+    "1": ["1-0", "2-1", "2-0", "3-0", "3-1", "3-2"],
+    "X": ["0-0", "1-1", "2-2", "3-3"],
+    "2": ["0-1", "1-2", "0-2", "0-3", "1-3", "2-3"],
+}
 
 POINTS_TEXT = (
     "📊 Punctaj:\n"
@@ -388,7 +387,7 @@ def db_one(query, params=()):
         return _conn.execute(query, params).fetchone()
 
 
-SCHEMA_VERSION = "2"   # crește numărul dacă schimbi structura tabelelor
+SCHEMA_VERSION = "3"   # crește numărul dacă schimbi structura tabelelor
 
 
 def init_db():
@@ -421,7 +420,7 @@ def init_db():
         venue TEXT, teams_known INTEGER DEFAULT 1, note TEXT,
         result_home INTEGER, result_away INTEGER, finished INTEGER DEFAULT 0)""")
     db_run("""CREATE TABLE IF NOT EXISTS match_predictions(
-        telegram_id INTEGER, match_id INTEGER, pick TEXT,
+        telegram_id INTEGER, match_id INTEGER, outcome TEXT, score TEXT,
         PRIMARY KEY(telegram_id, match_id))""")
     db_run("""CREATE TABLE IF NOT EXISTS results(kind TEXT PRIMARY KEY, value TEXT)""")
     db_run("""CREATE TABLE IF NOT EXISTS bonus(
@@ -590,7 +589,7 @@ def score_user(uid, results=None):
             lines.append(f"Grupa {letter}: {gp[k]} ⏳")
 
     # Meciuri
-    preds = db_all("SELECT match_id, pick FROM match_predictions WHERE telegram_id=?", (uid,))
+    preds = db_all("SELECT match_id, outcome, score FROM match_predictions WHERE telegram_id=?", (uid,))
     if preds:
         ids = [str(p["match_id"]) for p in preds]
         rows = db_all(
@@ -603,18 +602,13 @@ def score_user(uid, results=None):
                 continue
             rh, ra = m["result_home"], m["result_away"]
             res_out = outcome(rh, ra)
-            pick = p["pick"]
             gained = 0
-            if pick in ("1", "X", "2"):
-                if pick == res_out:
-                    gained = 3
-            else:
-                sc = parse_score(pick)
-                if sc:
-                    if sc == (rh, ra):
-                        gained = 5
-                    elif outcome(*sc) == res_out:
-                        gained = 3
+            if p["outcome"] and p["outcome"] == res_out:   # rezultat (1X2) corect
+                gained += 3
+            if p["score"]:                                  # scor exact corect
+                sc = parse_score(p["score"])
+                if sc and sc == (rh, ra):
+                    gained += 2
             mpts += gained
         if mpts:
             lines.append(f"Meciuri: +{fmt_pts(mpts)}p")
@@ -693,16 +687,28 @@ def kb_group(letter):
     return InlineKeyboardMarkup([btns[i:i + 2] for i in range(0, len(btns), 2)])
 
 
-def kb_match_scores(win, mid):
-    rows = []
-    for row in SCORE_ROWS:
-        line = []
-        for label in row:
-            pick = "alt" if label.startswith("✏️") else label
-            line.append(InlineKeyboardButton(label, callback_data=f"sp:{win}:{mid}:{pick}"))
-        rows.append(line)
-    rows.append([InlineKeyboardButton("« Înapoi la meciuri", callback_data=f"bl:{win}")])
+def kb_match_outcome(win, mid, home, away):
+    """Pasul 1: cine câștigă (1 / X / 2)."""
+    rows = [
+        [InlineKeyboardButton(f"1 — {home}", callback_data=f"so:{win}:{mid}:1")],
+        [InlineKeyboardButton("X — Egal", callback_data=f"so:{win}:{mid}:X")],
+        [InlineKeyboardButton(f"2 — {away}", callback_data=f"so:{win}:{mid}:2")],
+        [InlineKeyboardButton("« Înapoi la meciuri", callback_data=f"bl:{win}")],
+    ]
     return InlineKeyboardMarkup(rows)
+
+
+def kb_match_score(win, mid, oc):
+    """Pasul 2: scorul exact, doar scoruri compatibile cu rezultatul ales."""
+    scores = SCORE_BY_OUTCOME.get(oc, [])
+    rows = [scores[i:i + 3] for i in range(0, len(scores), 3)]
+    rows = [[InlineKeyboardButton(s, callback_data=f"sc:{win}:{mid}:{s}") for s in row]
+            for row in rows]
+    rows.append([InlineKeyboardButton("✏️ Alt scor", callback_data=f"sc:{win}:{mid}:alt"),
+                 InlineKeyboardButton("➡️ Fără scor exact", callback_data=f"sc:{win}:{mid}:none")])
+    rows.append([InlineKeyboardButton("« Schimbă rezultatul", callback_data=f"po:{win}:{mid}")])
+    return InlineKeyboardMarkup(rows)
+
 
 
 def kb_match_list(win, uid):
@@ -713,17 +719,20 @@ def kb_match_list(win, uid):
     rows = []
     for m in ms:
         pred = db_one(
-            "SELECT pick FROM match_predictions WHERE telegram_id=? AND match_id=?",
+            "SELECT outcome, score FROM match_predictions WHERE telegram_id=? AND match_id=?",
             (uid, m["id"]))
+        ptag = ""
+        if pred and pred["outcome"]:
+            ptag = pred["outcome"] + (f" {pred['score']}" if pred["score"] else "")
         if not m["teams_known"]:
             label = f"🔒 {fmt_kick(m['kickoff'])} {m['home']} – {m['away']}"
             rows.append([InlineKeyboardButton(label, callback_data="noop")])
         elif m["kickoff"] <= now_str():
-            tag = f" (tu: {pred['pick']})" if pred else ""
+            tag = f" (tu: {ptag})" if ptag else ""
             label = f"⏱ {fmt_kick(m['kickoff'])} {m['home']}–{m['away']}{tag}"
             rows.append([InlineKeyboardButton(label, callback_data="noop")])
         else:
-            tag = f" ✅{pred['pick']}" if pred else ""
+            tag = f" ✅{ptag}" if ptag else ""
             label = f"⚽️ {fmt_kick(m['kickoff'])} {m['home']}–{m['away']}{tag}"
             rows.append([InlineKeyboardButton(label, callback_data=f"po:{win}:{m['id']}")])
     return ms, InlineKeyboardMarkup(rows) if rows else None
@@ -769,7 +778,10 @@ async def prompt_next(bot, chat_id, uid):
 WELCOME = (
     "⚽️ Bun venit la Concursul Cupa Mondială 2026!\n\n"
     + POINTS_TEXT +
-    "\n\n📌 Comenzi: /azi · /maine · /pronosticurile · /clasament · /premii · /ajutor"
+    "\n\n📌 Comenzi:\n"
+    "/campioana · /golgheter · /grupe\n"
+    "/azi · /maine · /pronosticurile\n"
+    "/clasament · /premii · /ajutor"
 )
 
 
@@ -892,18 +904,19 @@ async def cmd_pronosticurile(update, context):
     out = ["🎯 PRONOSTICURILE TALE\n"]
     out += lines if lines else ["(încă nimic ales)"]
 
-    preds = db_all("SELECT match_id, pick FROM match_predictions WHERE telegram_id=?", (uid,))
+    preds = db_all("SELECT match_id, outcome, score FROM match_predictions WHERE telegram_id=?", (uid,))
     if preds:
         ids = [str(p["match_id"]) for p in preds]
         rows = db_all(f"SELECT * FROM matches WHERE id IN ({','.join('?'*len(ids))}) "
                       "ORDER BY kickoff", ids)
-        pby = {p["match_id"]: p["pick"] for p in preds}
+        pby = {p["match_id"]: (p["outcome"], p["score"]) for p in preds}
         upcoming = [r for r in rows if r["kickoff"] > now_str()]
         if upcoming:
             out.append("\n📌 Meciuri pariate (viitoare):")
             for r in upcoming:
-                out.append(f"• {fmt_kick(r['kickoff'])} {r['home']}–{r['away']}: "
-                           f"{pby[r['id']]}")
+                oc, sco = pby[r["id"]]
+                txt = (oc or "?") + (f", scor {sco}" if sco else "")
+                out.append(f"• {fmt_kick(r['kickoff'])} {r['home']}–{r['away']}: {txt}")
     out.append(f"\n💰 TOTAL: {fmt_pts(total)}p")
     await update.message.reply_text("\n".join(out))
 
@@ -916,6 +929,60 @@ async def cmd_id(update, context):
     u = update.effective_user
     await update.message.reply_text(
         f"ID-ul tău: {u.id}\nID-ul acestui chat: {update.effective_chat.id}")
+
+
+def resolve_uid(arg):
+    """Acceptă un ID numeric sau @username (din baza de date)."""
+    arg = (arg or "").strip()
+    if arg.startswith("@"):
+        row = db_one("SELECT telegram_id FROM users WHERE LOWER(username)=?", (arg[1:].lower(),))
+        return row["telegram_id"] if row else None
+    try:
+        return int(arg)
+    except ValueError:
+        return None
+
+
+async def _approved_or_msg(update):
+    uid = update.effective_user.id
+    row = db_one("SELECT approved FROM users WHERE telegram_id=?", (uid,))
+    if not row or not row["approved"]:
+        await update.message.reply_text("⏳ Trebuie să fii aprobat. Scrie /start.")
+        return False
+    return True
+
+
+async def cmd_my_champion(update, context):
+    """/campioana — jucătorul își alege/vede campioana (blocată după alegere)."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Scrie-mi în privat 🙂")
+        return
+    if not await _approved_or_msg(update):
+        return
+    uid = update.effective_user.id
+    cur = db_one("SELECT value FROM global_predictions WHERE telegram_id=? AND kind='champion'", (uid,))
+    if cur:
+        await update.message.reply_text(
+            f"🏆 Campioana ta: {cur['value']}\n(alegere blocată, nu se mai poate schimba)")
+    else:
+        await update.message.reply_text("Alege CAMPIOANA mondială:", reply_markup=kb_champion())
+
+
+async def cmd_my_topscorer(update, context):
+    """/golgheter — jucătorul își alege/vede golgheterul (blocat după alegere)."""
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Scrie-mi în privat 🙂")
+        return
+    if not await _approved_or_msg(update):
+        return
+    uid = update.effective_user.id
+    cur = db_one("SELECT value FROM global_predictions WHERE telegram_id=? AND kind='topscorer'", (uid,))
+    if cur:
+        await update.message.reply_text(
+            f"⚽️ Golgheterul tău: {cur['value']}\n(alegere blocată, nu se mai poate schimba)")
+    else:
+        await update.message.reply_text(
+            "Alege GOLGHETERUL turneului:", reply_markup=kb_topscorers_fav())
 
 
 # ==============================================================================
@@ -940,12 +1007,11 @@ async def cmd_setgrup(update, context):
 @admin_only
 async def cmd_aproba(update, context):
     if not context.args:
-        await update.message.reply_text("Folosire: /aproba <id>")
+        await update.message.reply_text("Folosire: /approve <id sau @user>")
         return
-    try:
-        uid = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("ID invalid.")
+    uid = resolve_uid(context.args[0])
+    if uid is None:
+        await update.message.reply_text("Participant negăsit. Vezi /pending.")
         return
     await approve_user(context, uid, update.message)
 
@@ -970,11 +1036,11 @@ async def approve_user(context, uid, reply_to=None):
 @admin_only
 async def cmd_resping(update, context):
     if not context.args:
-        await update.message.reply_text("Folosire: /resping <id>")
+        await update.message.reply_text("Folosire: /deny <id sau @user>")
         return
-    try:
-        uid = int(context.args[0])
-    except ValueError:
+    uid = resolve_uid(context.args[0])
+    if uid is None:
+        await update.message.reply_text("Participant negăsit.")
         return
     db_run("DELETE FROM users WHERE telegram_id=?", (uid,))
     db_run("DELETE FROM global_predictions WHERE telegram_id=?", (uid,))
@@ -1035,9 +1101,9 @@ async def cmd_anuleaza_scor(update, context):
 
 
 @admin_only
-async def cmd_grupa(update, context):
+async def cmd_setgroupwinner(update, context):
     if len(context.args) < 2:
-        await update.message.reply_text("Folosire: /grupa A Mexic")
+        await update.message.reply_text("Folosire: /setgroupwinner A Mexic")
         return
     letter = context.args[0].upper()
     if letter not in GROUPS:
@@ -1053,22 +1119,22 @@ async def cmd_grupa(update, context):
 
 
 @admin_only
-async def cmd_campioana(update, context):
+async def cmd_setchampion(update, context):
     if not context.args:
-        await update.message.reply_text("Folosire: /campioana Spania")
+        await update.message.reply_text("Folosire: /setchampion Spania")
         return
     team = find_team(" ".join(context.args), ALL_TEAMS)
     if not team:
         await update.message.reply_text("Echipă negăsită. Scrie numele exact.")
         return
     set_result("champion", team)
-    await update.message.reply_text(f"✅ Campioana mondială: {team}")
+    await update.message.reply_text(f"✅ Campioana mondială (rezultat): {team}")
 
 
 @admin_only
-async def cmd_golgheter(update, context):
+async def cmd_setgolgheter(update, context):
     if not context.args:
-        await update.message.reply_text("Folosire: /golgheter Mbappe  (sau /golgheter ALTUL)")
+        await update.message.reply_text("Folosire: /setgolgheter Mbappe  (sau /setgolgheter ALTUL)")
         return
     raw = " ".join(context.args)
     if norm(raw) == "altul":
@@ -1079,7 +1145,7 @@ async def cmd_golgheter(update, context):
     value = player or raw
     set_result("topscorer", value)
     extra = "" if player else " (⚠️ nu e în listă — câștigă cei cu 'ALTUL')"
-    await update.message.reply_text(f"✅ Golgheter: {value}{extra}")
+    await update.message.reply_text(f"✅ Golgheter (rezultat): {value}{extra}")
 
 
 def set_result(kind, value):
@@ -1087,7 +1153,7 @@ def set_result(kind, value):
 
 
 @admin_only
-async def cmd_lista(update, context):
+async def cmd_listmatches(update, context):
     rows = db_all("SELECT * FROM matches ORDER BY kickoff")
     out = ["📋 MECIURI (ID · oră · meci · rezultat)\n"]
     for m in rows:
@@ -1285,20 +1351,12 @@ async def cmd_bonus(update, context):
 
 
 @admin_only
-async def cmd_reset_pronosticuri(update, context):
-    db_run("DELETE FROM match_predictions")
-    await update.message.reply_text("✅ Toate pronosticurile pe meciuri au fost șterse.")
-
-
-@admin_only
-async def cmd_reset_rezultate(update, context):
-    db_run("DELETE FROM results")
-    db_run("UPDATE matches SET result_home=NULL, result_away=NULL, finished=0")
-    await update.message.reply_text("✅ Toate rezultatele au fost șterse.")
-
-
-@admin_only
-async def cmd_reset_tot(update, context):
+async def cmd_reset_game(update, context):
+    if not context.args or context.args[0] != "CONFIRM":
+        await update.message.reply_text(
+            "⚠️ Asta șterge TOATE pronosticurile, rezultatele și bonusurile.\n"
+            "Participanții RĂMÂN (nu reintră în grup).\n\nScrie: /reset_game CONFIRM")
+        return
     db_run("DELETE FROM match_predictions")
     db_run("DELETE FROM global_predictions")
     db_run("DELETE FROM results")
@@ -1306,8 +1364,218 @@ async def cmd_reset_tot(update, context):
     db_run("UPDATE matches SET result_home=NULL, result_away=NULL, finished=0")
     set_config("open_groups", "A,B")
     await update.message.reply_text(
-        "✅ Resetat TOT (pronosticuri, rezultate, bonus). Participanții AU RĂMAS — "
-        "nu trebuie să intre din nou. Pot reîncepe cu /start.")
+        "✅ Joc resetat. Participanții au rămas — dau /start și aleg din nou.")
+
+
+@admin_only
+async def cmd_reset_all(update, context):
+    if not context.args or context.args[0] != "CONFIRM":
+        await update.message.reply_text(
+            "⚠️ RESETARE TOTALĂ (de fabrică): șterge TOT, inclusiv participanții.\n"
+            "Toți vor trebui să intre din nou cu /start.\n\nScrie: /reset_all CONFIRM")
+        return
+    for t in ("users", "global_predictions", "matches",
+              "match_predictions", "results", "bonus"):
+        db_run(f"DELETE FROM {t}")
+    db_run("DELETE FROM config WHERE key IN ('open_groups','seeded')")
+    for m in SEED_MATCHES:
+        db_run("""INSERT INTO matches(stage,grp,home,away,kickoff,venue,teams_known,note)
+                  VALUES(?,?,?,?,?,?,?,?)""", m)
+    set_config("seeded", "1")
+    set_config("open_groups", "A,B")
+    await update.message.reply_text(
+        "✅ Resetare totală (de fabrică) făcută. Toți trebuie să dea /start din nou.")
+
+
+@admin_only
+async def cmd_pending(update, context):
+    rows = db_all("SELECT telegram_id, full_name, username FROM users WHERE approved=0 ORDER BY joined_at")
+    if not rows:
+        await update.message.reply_text("Nimeni în așteptare. ✅")
+        return
+    await update.message.reply_text(f"⏳ {len(rows)} cereri în așteptare:")
+    for r in rows:
+        un = f"@{r['username']}" if r["username"] else ""
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Aprobă", callback_data=f"adm:ok:{r['telegram_id']}"),
+            InlineKeyboardButton("❌ Respinge", callback_data=f"adm:no:{r['telegram_id']}")]])
+        await update.message.reply_text(
+            f"{r['full_name']} {un} — ID {r['telegram_id']}", reply_markup=kb)
+
+
+@admin_only
+async def cmd_participanti(update, context):
+    rows = db_all("SELECT telegram_id, full_name, username FROM users WHERE approved=1 ORDER BY full_name")
+    pend = db_one("SELECT COUNT(*) c FROM users WHERE approved=0")["c"]
+    if not rows:
+        await update.message.reply_text(f"Niciun participant aprobat. (În așteptare: {pend})")
+        return
+    out = [f"👥 PARTICIPANȚI APROBAȚI ({len(rows)})\n"]
+    for r in rows:
+        un = f"@{r['username']}" if r["username"] else ""
+        out.append(f"• {r['full_name']} {un} — ID {r['telegram_id']}")
+    if pend:
+        out.append(f"\n⏳ În așteptare: {pend} (vezi /pending)")
+    await update.message.reply_text("\n".join(out))
+
+
+def _global_summary(uid):
+    gp = {r["kind"]: r["value"] for r in
+          db_all("SELECT kind,value FROM global_predictions WHERE telegram_id=?", (uid,))}
+    champ = gp.get("champion", "—")
+    ts = gp.get("topscorer", "—")
+    grps = ", ".join(f"{k.split('_')[1]}:{v}" for k, v in sorted(gp.items())
+                     if k.startswith("group_")) or "—"
+    return champ, ts, grps
+
+
+@admin_only
+async def cmd_allpicks(update, context):
+    users = db_all("SELECT telegram_id, full_name FROM users WHERE approved=1 ORDER BY full_name")
+    if not users:
+        await update.message.reply_text("Niciun participant aprobat.")
+        return
+    out = ["🗂 PRONOSTICURILE TUTUROR\n"]
+    for u in users:
+        uid = u["telegram_id"]
+        champ, ts, grps = _global_summary(uid)
+        nm = db_one("SELECT COUNT(*) c FROM match_predictions WHERE telegram_id=?", (uid,))["c"]
+        out.append(f"👤 {u['full_name']}\n   Campioană: {champ} | Golgheter: {ts}\n"
+                   f"   Grupe: {grps} | Meciuri pariate: {nm}")
+    text = "\n".join(out)
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
+
+
+@admin_only
+async def cmd_picks(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /picks <id sau @user>")
+        return
+    uid = resolve_uid(context.args[0])
+    u = db_one("SELECT full_name FROM users WHERE telegram_id=?", (uid,)) if uid else None
+    if not u:
+        await update.message.reply_text("Participant negăsit.")
+        return
+    total, lines = score_user(uid)
+    out = [f"🎯 Pronosticurile lui {u['full_name']}\n"] + (lines or ["(nimic ales)"])
+    preds = db_all("SELECT match_id, outcome, score FROM match_predictions WHERE telegram_id=?", (uid,))
+    if preds:
+        ids = [str(p["match_id"]) for p in preds]
+        rows = db_all(f"SELECT * FROM matches WHERE id IN ({','.join('?'*len(ids))}) ORDER BY kickoff", ids)
+        pby = {p["match_id"]: (p["outcome"], p["score"]) for p in preds}
+        out.append("\n📌 Meciuri:")
+        for r in rows:
+            oc, sco = pby[r["id"]]
+            out.append(f"• {fmt_kick(r['kickoff'])} {r['home']}–{r['away']}: "
+                       f"{oc or '?'}{(' ' + sco) if sco else ''}")
+    out.append(f"\n💰 TOTAL: {fmt_pts(total)}p")
+    text = "\n".join(out)
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
+
+
+@admin_only
+async def cmd_matchpicks(update, context):
+    args = list(context.args)
+    dont = False
+    if args and args[0].lower() in ("dont", "nu", "fara"):
+        dont = True
+        args = args[1:]
+    if not args:
+        await update.message.reply_text(
+            "Folosire: /matchpicks <id_meci>\nsau: /matchpicks dont <id_meci>")
+        return
+    try:
+        mid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID meci invalid. Vezi /listmatches")
+        return
+    m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
+    if not m:
+        await update.message.reply_text("Meci inexistent. Vezi /listmatches")
+        return
+    approved = db_all("SELECT telegram_id, full_name FROM users WHERE approved=1 ORDER BY full_name")
+    predmap = {p["telegram_id"]: (p["outcome"], p["score"]) for p in
+               db_all("SELECT telegram_id, outcome, score FROM match_predictions WHERE match_id=?", (mid,))}
+    head = f"⚽️ {m['home']} – {m['away']} ({fmt_kick(m['kickoff'])})\n"
+    if dont:
+        missing = [u["full_name"] for u in approved if u["telegram_id"] not in predmap]
+        body = ("\n".join("• " + n for n in missing) if missing else "(toți au pronosticat)")
+        out = head + f"\n❌ NU au pronosticat ({len(missing)}):\n" + body
+    else:
+        lines = []
+        for u in approved:
+            if u["telegram_id"] in predmap:
+                oc, sco = predmap[u["telegram_id"]]
+                lines.append(f"• {u['full_name']}: {oc or '?'}{(' ' + sco) if sco else ''}")
+        body = ("\n".join(lines) if lines else "(nimeni încă)")
+        out = head + f"\n📊 Pronosticuri ({len(lines)}):\n" + body
+    for i in range(0, len(out), 3800):
+        await update.message.reply_text(out[i:i + 3800])
+
+
+@admin_only
+async def cmd_setpot(update, context):
+    if not context.args:
+        await update.message.reply_text("Folosire: /setpot 500 RON")
+        return
+    suma = context.args[0]
+    moneda = context.args[1] if len(context.args) > 1 else "RON"
+    set_config("prizes", f"💰 Premiu total: {suma} {moneda}")
+    await update.message.reply_text(f"✅ Premiu setat: {suma} {moneda}")
+
+
+async def _broadcast_matches(context, win):
+    """Trimite fiecărui participant aprobat lista de meciuri (azi/mâine) cu butoane."""
+    titlu = "📅 MECIURILE DE AZI" if win == "a" else "📅 MECIURILE DE MÂINE"
+    n = 0
+    for u in db_all("SELECT telegram_id FROM users WHERE approved=1"):
+        uid = u["telegram_id"]
+        ms, kb = kb_match_list(win, uid)
+        if not ms:
+            continue
+        try:
+            await context.bot.send_message(
+                uid, titlu + "\n\nApasă pe un meci ca să pronostichezi:", reply_markup=kb)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+async def cmd_verifica(update, context):
+    """/verifica — admin: trimite meciurile de azi la toți; user: vede meciurile lui."""
+    if is_admin(update.effective_user.id):
+        n = await _broadcast_matches(context, "a")
+        await update.message.reply_text(f"📣 Trimis meciurile de azi la {n} participanți.")
+    else:
+        await show_window(update, context, "a")
+
+
+@admin_only
+async def cmd_announce_today(update, context):
+    n = await _broadcast_matches(context, "a")
+    await update.message.reply_text(f"📣 Trimis meciurile de azi la {n} participanți.")
+
+
+@admin_only
+async def cmd_announce_tomorrow(update, context):
+    n = await _broadcast_matches(context, "m")
+    await update.message.reply_text(f"📣 Trimis meciurile de mâine la {n} participanți.")
+
+
+@admin_only
+async def cmd_postleaderboard(update, context):
+    gid = get_config("group_chat_id")
+    if not gid:
+        await update.message.reply_text("Întâi rulează /setgrup în grup.")
+        return
+    try:
+        await context.bot.send_message(int(gid), render_leaderboard())
+        await update.message.reply_text("✅ Clasament postat în grup.")
+    except Exception as e:
+        await update.message.reply_text(f"Eroare la postare: {e}")
 
 
 # ==============================================================================
@@ -1394,7 +1662,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await prompt_next(context.bot, q.message.chat_id, uid)
         return
 
-    # --- deschide tastatura de scor pt un meci ---
+    # --- PASUL 1: deschide alegerea rezultatului (1/X/2) ---
     if data.startswith("po:"):
         _, win, mid = data.split(":")
         mid = int(mid)
@@ -1408,19 +1676,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m["kickoff"] <= now_str():
             await q.answer("Meciul a început, nu mai poți pronostica.", show_alert=True)
             return
-        pred = db_one("SELECT pick FROM match_predictions WHERE telegram_id=? AND match_id=?",
-                      (uid, mid))
-        cur = f"\nPronosticul tău acum: {pred['pick']}" if pred else ""
         await q.answer()
         await q.edit_message_text(
-            f"⚽️ {m['home']} – {m['away']}\n{fmt_kick(m['kickoff'])} · {m['venue']}{cur}\n\n"
-            "Alege rezultatul (1X2) sau scorul exact (+2p):",
-            reply_markup=kb_match_scores(win, mid))
+            f"⚽️ {m['home']} – {m['away']}\n{fmt_kick(m['kickoff'])} · {m['venue']}\n\n"
+            "1️⃣ Cine câștigă? (3p)",
+            reply_markup=kb_match_outcome(win, mid, m["home"], m["away"]))
         return
 
-    # --- salvează pronosticul ---
-    if data.startswith("sp:"):
-        _, win, mid, pick = data.split(":", 3)
+    # --- PASUL 1 -> salvează rezultatul și trece la scor (pasul 2) ---
+    if data.startswith("so:"):
+        _, win, mid, oc = data.split(":")
         mid = int(mid)
         m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
         if not m or not m["teams_known"]:
@@ -1429,19 +1694,49 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m["kickoff"] <= now_str():
             await q.answer("Meciul a început.", show_alert=True)
             return
-        if pick == "alt":
-            context.user_data["await"] = f"score:{mid}:{win}"
+        # salvăm rezultatul; resetăm scorul (se realege la pasul 2)
+        db_run("INSERT OR REPLACE INTO match_predictions(telegram_id,match_id,outcome,score) "
+               "VALUES(?,?,?,NULL)", (uid, mid, oc))
+        ales = m["home"] if oc == "1" else (m["away"] if oc == "2" else "Egal")
+        await q.answer("Rezultat salvat ✅")
+        await q.edit_message_text(
+            f"⚽️ {m['home']} – {m['away']}\nRezultat ales: {ales} ✅\n\n"
+            "2️⃣ Scorul exact? (+2p, opțional)",
+            reply_markup=kb_match_score(win, mid, oc))
+        return
+
+    # --- PASUL 2 -> salvează scorul exact (sau fără scor / alt scor) ---
+    if data.startswith("sc:"):
+        _, win, mid, val = data.split(":", 3)
+        mid = int(mid)
+        m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
+        pr = db_one("SELECT outcome FROM match_predictions WHERE telegram_id=? AND match_id=?",
+                    (uid, mid))
+        if not m or not m["teams_known"] or not pr:
+            await q.answer("Indisponibil.", show_alert=True)
+            return
+        if m["kickoff"] <= now_str():
+            await q.answer("Meciul a început.", show_alert=True)
+            return
+        if val == "alt":
+            context.user_data["await"] = f"score:{mid}:{win}:{pr['outcome']}"
             await q.answer()
             await q.edit_message_text(
-                f"✏️ {m['home']} – {m['away']}\nScrie scorul (ex: 4-2):")
+                f"✏️ {m['home']} – {m['away']}\nScrie scorul exact (ex: 3-2):")
             return
-        db_run("INSERT OR REPLACE INTO match_predictions(telegram_id,match_id,pick) VALUES(?,?,?)",
-               (uid, mid, pick))
-        await q.answer(f"Salvat: {pick} ✅", show_alert=False)
+        if val == "none":
+            db_run("UPDATE match_predictions SET score=NULL WHERE telegram_id=? AND match_id=?",
+                   (uid, mid))
+            conf = "✅ Salvat (doar rezultatul)."
+        else:
+            db_run("UPDATE match_predictions SET score=? WHERE telegram_id=? AND match_id=?",
+                   (val, uid, mid))
+            conf = f"✅ Salvat: rezultat {pr['outcome']}, scor {val}."
+        await q.answer("Salvat ✅")
         ms, kb = kb_match_list(win, uid)
         try:
             await q.edit_message_text(
-                "✅ Pronostic salvat. Poți schimba până începe meciul.\n\n"
+                conf + " Poți schimba până începe meciul.\n\n"
                 "Apasă alt meci sau /pronosticurile.", reply_markup=kb)
         except Exception:
             pass
@@ -1485,23 +1780,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state.startswith("score:"):
-        _, mid, win = state.split(":")
+        _, mid, win, oc = state.split(":")
         mid = int(mid)
         sc = parse_score(text)
         if not sc:
             await update.message.reply_text("Scor invalid. Scrie ceva de forma 4-2:")
+            return
+        if outcome(*sc) != oc:
+            ales = OUTCOME_LABEL.get(oc, oc)
+            await update.message.reply_text(
+                f"Scorul {sc[0]}-{sc[1]} nu se potrivește cu rezultatul ales ({oc} – {ales}). "
+                "Mai scrie un scor potrivit:")
             return
         m = db_one("SELECT * FROM matches WHERE id=?", (mid,))
         if not m or m["kickoff"] <= now_str():
             context.user_data.pop("await", None)
             await update.message.reply_text("Meciul nu mai e disponibil.")
             return
-        pick = f"{sc[0]}-{sc[1]}"
-        db_run("INSERT OR REPLACE INTO match_predictions(telegram_id,match_id,pick) VALUES(?,?,?)",
-               (uid, mid, pick))
+        score = f"{sc[0]}-{sc[1]}"
+        db_run("UPDATE match_predictions SET score=? WHERE telegram_id=? AND match_id=?",
+               (score, uid, mid))
         context.user_data.pop("await", None)
         await update.message.reply_text(
-            f"✅ Pronostic salvat: {m['home']} {pick} {m['away']}.\n"
+            f"✅ Pronostic salvat: {m['home']} {score} {m['away']} (rezultat {oc}).\n"
             "Mai vezi meciuri cu /azi sau /maine.")
         return
 
@@ -1570,41 +1871,61 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # utilizator
+    # ---- JUCĂTOR ----
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ajutor", cmd_ajutor))
     app.add_handler(CommandHandler("help", cmd_ajutor))
+    app.add_handler(CommandHandler("campioana", cmd_my_champion))
+    app.add_handler(CommandHandler("golgheter", cmd_my_topscorer))
+    app.add_handler(CommandHandler("grupe", cmd_grupe))
     app.add_handler(CommandHandler("azi", cmd_azi))
     app.add_handler(CommandHandler("maine", cmd_maine))
-    app.add_handler(CommandHandler("grupe", cmd_grupe))
+    app.add_handler(CommandHandler("verifica", cmd_verifica))
     app.add_handler(CommandHandler("pronosticurile", cmd_pronosticurile))
     app.add_handler(CommandHandler("clasament", cmd_clasament))
     app.add_handler(CommandHandler("premii", cmd_premii))
     app.add_handler(CommandHandler("id", cmd_id))
 
-    # admin
-    app.add_handler(CommandHandler("setgrup", cmd_setgrup))
-    app.add_handler(CommandHandler("aproba", cmd_aproba))
-    app.add_handler(CommandHandler("resping", cmd_resping))
-    app.add_handler(CommandHandler("useri", cmd_useri))
+    # ---- ADMIN: participanți ----
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("approve", cmd_aproba))
+    app.add_handler(CommandHandler("deny", cmd_resping))
+    app.add_handler(CommandHandler("participanti", cmd_participanti))
+
+    # ---- ADMIN: vizualizare pronosticuri ----
+    app.add_handler(CommandHandler("allpicks", cmd_allpicks))
+    app.add_handler(CommandHandler("picks", cmd_picks))
+    app.add_handler(CommandHandler("matchpicks", cmd_matchpicks))
+
+    # ---- ADMIN: rezultate ----
+    app.add_handler(CommandHandler("setscore", cmd_scor))
     app.add_handler(CommandHandler("scor", cmd_scor))
     app.add_handler(CommandHandler("anuleaza_scor", cmd_anuleaza_scor))
-    app.add_handler(CommandHandler("grupa", cmd_grupa))
-    app.add_handler(CommandHandler("campioana", cmd_campioana))
-    app.add_handler(CommandHandler("golgheter", cmd_golgheter))
-    app.add_handler(CommandHandler("lista", cmd_lista))
+    app.add_handler(CommandHandler("setgroupwinner", cmd_setgroupwinner))
+    app.add_handler(CommandHandler("setchampion", cmd_setchampion))
+    app.add_handler(CommandHandler("setgolgheter", cmd_setgolgheter))
+
+    # ---- ADMIN: meciuri ----
+    app.add_handler(CommandHandler("listmatches", cmd_listmatches))
     app.add_handler(CommandHandler("echipe", cmd_echipe))
     app.add_handler(CommandHandler("ora", cmd_ora))
     app.add_handler(CommandHandler("amical", cmd_amical))
     app.add_handler(CommandHandler("adauga_meci", cmd_adauga_meci))
     app.add_handler(CommandHandler("sterge_meci", cmd_sterge_meci))
     app.add_handler(CommandHandler("deschide_grupa", cmd_deschide_grupa))
-    app.add_handler(CommandHandler("premii_set", cmd_premii_set))
+
+    # ---- ADMIN: anunțuri & premii ----
+    app.add_handler(CommandHandler("announcetoday", cmd_announce_today))
+    app.add_handler(CommandHandler("announcetomorrow", cmd_announce_tomorrow))
+    app.add_handler(CommandHandler("postleaderboard", cmd_postleaderboard))
+    app.add_handler(CommandHandler("setpot", cmd_setpot))
     app.add_handler(CommandHandler("anunt", cmd_anunt))
     app.add_handler(CommandHandler("bonus", cmd_bonus))
-    app.add_handler(CommandHandler("reset_pronosticuri", cmd_reset_pronosticuri))
-    app.add_handler(CommandHandler("reset_rezultate", cmd_reset_rezultate))
-    app.add_handler(CommandHandler("reset_tot", cmd_reset_tot))
+    app.add_handler(CommandHandler("setgrup", cmd_setgrup))
+
+    # ---- ADMIN: resetări ----
+    app.add_handler(CommandHandler("reset_game", cmd_reset_game))
+    app.add_handler(CommandHandler("reset_all", cmd_reset_all))
 
     # butoane + text + membri noi
     app.add_handler(CallbackQueryHandler(on_callback))
