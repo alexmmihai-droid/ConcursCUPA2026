@@ -87,6 +87,18 @@ def init_db():
     d = os.path.dirname(os.path.abspath(DB_PATH))
     os.makedirs(d, exist_ok=True)
     with db() as c:
+        # --- reparare schemă veche/incompatibilă (ex: 'users' fără coloana 'user_id') ---
+        urow = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        if urow:
+            ucols0 = [r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()]
+            if "user_id" not in ucols0:
+                log.warning("Schemă veche detectată (tabela 'users' fără 'user_id') — reconstruiesc tabelele de date.")
+                c.execute("DROP TABLE IF EXISTS users_backup")
+                c.execute("ALTER TABLE users RENAME TO users_backup")
+                for _tbl in ("match_predictions", "group_picks", "champion_picks", "scorer_picks",
+                             "group_results", "matches", "bonus_points", "teams"):
+                    c.execute(f"DROP TABLE IF EXISTS {_tbl}")
+                c.execute("DELETE FROM config WHERE key='matches_seeded'")
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS users(
@@ -1392,6 +1404,10 @@ async def job_leaderboard(context):
 # ------------------------------------------------------------------ #
 #  PORNIRE
 # ------------------------------------------------------------------ #
+async def on_error(update, context):
+    log.error("Eroare la procesarea unui update", exc_info=context.error)
+
+
 async def post_init(app):
     init_db()
     participant_cmds = [
@@ -1453,6 +1469,7 @@ def main():
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS nu e setat.")
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler(["ajutor", "help"], cmd_help))
