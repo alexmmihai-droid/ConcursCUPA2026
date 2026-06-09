@@ -1591,6 +1591,28 @@ async def cmd_postleaderboard(update, context):
         await update.message.reply_text(leaderboard_text())
 
 
+async def cmd_loadmatches(update, context):
+    if not is_admin(update):
+        return
+    if not (context.args and context.args[0] == "CONFIRM"):
+        await update.message.reply_text(
+            f"⚠️ /loadmatches reîncarcă cele {len(WC_MATCHES)} meciuri oficiale CM 2026.\n"
+            "Șterge meciurile actuale și pariurile pe meci, dar PĂSTREAZĂ jucătorii, campioana, grupele și golgheterul.\n"
+            "Confirmă: /loadmatches CONFIRM")
+        return
+    with db() as c:
+        c.execute("DELETE FROM match_predictions")
+        c.execute("DELETE FROM matches")
+        try:
+            c.execute("DELETE FROM sqlite_sequence WHERE name='matches'")
+        except sqlite3.OperationalError:
+            pass
+        for kickoff, home, away, stage in WC_MATCHES:
+            c.execute("INSERT INTO matches(home, away, kickoff, stage) VALUES(?,?,?,?)", (home, away, kickoff, stage))
+        c.execute("INSERT INTO config(key,value) VALUES('matches_seeded_v2','1') ON CONFLICT(key) DO UPDATE SET value='1'")
+    await update.message.reply_text(f"✅ Am încărcat {len(WC_MATCHES)} meciuri (de la #1 la #{len(WC_MATCHES)}). Verifică cu /listmatches.")
+
+
 # ------------------------------------------------------------------ #
 #  ADMIN — resetare (NU șterge jucătorii)
 # ------------------------------------------------------------------ #
@@ -1707,6 +1729,7 @@ async def post_init(app):
         BotCommand("editmatch", "Editează meci"),
         BotCommand("delmatch", "Șterge meci"),
         BotCommand("listmatches", "Lista meciurilor"),
+        BotCommand("loadmatches", "Reîncarcă cele 104 meciuri"),
         BotCommand("setresult", "Rezultat (câștigător + scor)"),
         BotCommand("score", "Scor la un meci"),
         BotCommand("setgroupwinner", "Câștigătoarea unei grupe"),
@@ -1781,6 +1804,7 @@ def main():
     app.add_handler(CommandHandler("announcetomorrow", cmd_announcetomorrow))
     app.add_handler(CommandHandler("postleaderboard", cmd_postleaderboard))
     app.add_handler(CommandHandler("reset_game", cmd_reset_game))
+    app.add_handler(CommandHandler("loadmatches", cmd_loadmatches))
     app.add_handler(CommandHandler("reset_all", cmd_reset_all))
 
     app.add_handler(CallbackQueryHandler(cb_champ, pattern=r"^champ:"))
