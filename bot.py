@@ -24,6 +24,7 @@ import os
 import logging
 import sqlite3
 import contextlib
+import re
 import unicodedata
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
@@ -49,6 +50,18 @@ POINTS_MATCH = 3
 POINTS_GROUP = 2
 POINTS_CHAMPION = 5
 POINTS_SCORER = 4
+POINTS_SCORE = 2  # scor exact (bonus la pariul pe meci)
+
+# Scoruri oferite ca butoane, în funcție de 1/X/2 ("2" = inversul lui "1")
+SCORE_OPTIONS = {
+    "HOME": [["1-0", "2-0", "3-0"], ["2-1", "3-1", "3-2"], ["4-0", "4-1", "4-2"]],
+    "DRAW": [["0-0", "1-1", "2-2", "3-3"]],
+    "AWAY": [["0-1", "0-2", "0-3"], ["1-2", "1-3", "2-3"], ["0-4", "1-4", "2-4"]],
+}
+
+
+def norm_score(s):
+    return (s or "").replace(" ", "").strip()
 
 logging.basicConfig(format="%(asctime)s — %(levelname)s — %(message)s", level=logging.INFO)
 log = logging.getLogger("cupa-bot")
@@ -69,6 +82,134 @@ TEAMS = {
 }
 GROUP_LABELS = list(TEAMS.keys())
 DEFAULT_OPEN_GROUPS = ",".join(GROUP_LABELS)  # TOATE deschise
+
+# Candidați golgheter (listă din care aleg jucătorii; pot scrie și alt nume)
+SCORERS = [
+    "Kylian Mbappé (Franța)", "Erling Haaland (Norvegia)", "Harry Kane (Anglia)",
+    "Vinícius Júnior (Brazilia)", "Lautaro Martínez (Argentina)", "Julián Álvarez (Argentina)",
+    "Cristiano Ronaldo (Portugalia)", "Rafael Leão (Portugalia)", "Lamine Yamal (Spania)",
+    "Álvaro Morata (Spania)", "Nico Williams (Spania)", "Memphis Depay (Țările de Jos)",
+    "Cody Gakpo (Țările de Jos)", "Romelu Lukaku (Belgia)", "Jamal Musiala (Germania)",
+    "Kai Havertz (Germania)", "Mohamed Salah (Egipt)", "Darwin Núñez (Uruguay)",
+    "Christian Pulisic (SUA)", "Son Heung-min (Coreea de Sud)", "Breel Embolo (Elveția)",
+    "Youssef En-Nesyri (Maroc)", "Phil Foden (Anglia)", "Bukayo Saka (Anglia)",
+    "Santiago Giménez (Mexic)",
+]
+
+# Programul complet CM 2026 (ora României). Eliminatoriile au nume provizorii — editabile cu /editmatch.
+WC_MATCHES = [
+    # ---- Faza grupelor (ora României) ----
+    ("2026-06-11 22:00", "Mexic", "Africa de Sud", "Grupa A"),
+    ("2026-06-12 05:00", "Coreea de Sud", "Cehia", "Grupa A"),
+    ("2026-06-12 22:00", "Canada", "Bosnia și Herțegovina", "Grupa B"),
+    ("2026-06-13 04:00", "SUA", "Paraguay", "Grupa D"),
+    ("2026-06-13 22:00", "Qatar", "Elveția", "Grupa B"),
+    ("2026-06-14 01:00", "Brazilia", "Maroc", "Grupa C"),
+    ("2026-06-14 04:00", "Haiti", "Scoția", "Grupa C"),
+    ("2026-06-14 07:00", "Australia", "Turcia", "Grupa D"),
+    ("2026-06-14 20:00", "Germania", "Curacao", "Grupa E"),
+    ("2026-06-14 23:00", "Țările de Jos", "Japonia", "Grupa F"),
+    ("2026-06-15 02:00", "Coasta de Fildeș", "Ecuador", "Grupa E"),
+    ("2026-06-15 05:00", "Suedia", "Tunisia", "Grupa F"),
+    ("2026-06-15 19:00", "Spania", "Capul Verde", "Grupa H"),
+    ("2026-06-15 22:00", "Belgia", "Egipt", "Grupa G"),
+    ("2026-06-16 01:00", "Arabia Saudită", "Uruguay", "Grupa H"),
+    ("2026-06-16 04:00", "Iran", "Noua Zeelandă", "Grupa G"),
+    ("2026-06-16 22:00", "Franța", "Senegal", "Grupa I"),
+    ("2026-06-17 01:00", "Irak", "Norvegia", "Grupa I"),
+    ("2026-06-17 04:00", "Argentina", "Algeria", "Grupa J"),
+    ("2026-06-17 07:00", "Austria", "Iordania", "Grupa J"),
+    ("2026-06-17 20:00", "Portugalia", "DR Congo", "Grupa K"),
+    ("2026-06-17 23:00", "Anglia", "Croația", "Grupa L"),
+    ("2026-06-18 02:00", "Ghana", "Panama", "Grupa L"),
+    ("2026-06-18 05:00", "Uzbekistan", "Columbia", "Grupa K"),
+    ("2026-06-18 19:00", "Cehia", "Africa de Sud", "Grupa A"),
+    ("2026-06-18 22:00", "Elveția", "Bosnia și Herțegovina", "Grupa B"),
+    ("2026-06-19 01:00", "Canada", "Qatar", "Grupa B"),
+    ("2026-06-19 04:00", "Mexic", "Coreea de Sud", "Grupa A"),
+    ("2026-06-19 22:00", "SUA", "Australia", "Grupa D"),
+    ("2026-06-20 01:00", "Scoția", "Maroc", "Grupa C"),
+    ("2026-06-20 03:30", "Brazilia", "Haiti", "Grupa C"),
+    ("2026-06-20 06:00", "Turcia", "Paraguay", "Grupa D"),
+    ("2026-06-20 20:00", "Țările de Jos", "Suedia", "Grupa F"),
+    ("2026-06-20 23:00", "Germania", "Coasta de Fildeș", "Grupa E"),
+    ("2026-06-21 03:00", "Ecuador", "Curacao", "Grupa E"),
+    ("2026-06-21 07:00", "Tunisia", "Japonia", "Grupa F"),
+    ("2026-06-21 19:00", "Spania", "Arabia Saudită", "Grupa H"),
+    ("2026-06-21 22:00", "Belgia", "Iran", "Grupa G"),
+    ("2026-06-22 01:00", "Uruguay", "Capul Verde", "Grupa H"),
+    ("2026-06-22 04:00", "Noua Zeelandă", "Egipt", "Grupa G"),
+    ("2026-06-22 20:00", "Argentina", "Austria", "Grupa J"),
+    ("2026-06-23 00:00", "Franța", "Irak", "Grupa I"),
+    ("2026-06-23 03:00", "Norvegia", "Senegal", "Grupa I"),
+    ("2026-06-23 06:00", "Iordania", "Algeria", "Grupa J"),
+    ("2026-06-23 20:00", "Portugalia", "Uzbekistan", "Grupa K"),
+    ("2026-06-23 23:00", "Anglia", "Ghana", "Grupa L"),
+    ("2026-06-24 02:00", "Panama", "Croația", "Grupa L"),
+    ("2026-06-24 05:00", "Columbia", "DR Congo", "Grupa K"),
+    ("2026-06-24 22:00", "Elveția", "Canada", "Grupa B"),
+    ("2026-06-24 22:00", "Bosnia și Herțegovina", "Qatar", "Grupa B"),
+    ("2026-06-25 01:00", "Maroc", "Haiti", "Grupa C"),
+    ("2026-06-25 01:00", "Scoția", "Brazilia", "Grupa C"),
+    ("2026-06-25 04:00", "Africa de Sud", "Coreea de Sud", "Grupa A"),
+    ("2026-06-25 04:00", "Cehia", "Mexic", "Grupa A"),
+    ("2026-06-25 23:00", "Curacao", "Coasta de Fildeș", "Grupa E"),
+    ("2026-06-25 23:00", "Ecuador", "Germania", "Grupa E"),
+    ("2026-06-26 02:00", "Tunisia", "Țările de Jos", "Grupa F"),
+    ("2026-06-26 02:00", "Japonia", "Suedia", "Grupa F"),
+    ("2026-06-26 05:00", "Turcia", "SUA", "Grupa D"),
+    ("2026-06-26 05:00", "Paraguay", "Australia", "Grupa D"),
+    ("2026-06-26 22:00", "Norvegia", "Franța", "Grupa I"),
+    ("2026-06-26 22:00", "Senegal", "Irak", "Grupa I"),
+    ("2026-06-27 03:00", "Capul Verde", "Arabia Saudită", "Grupa H"),
+    ("2026-06-27 03:00", "Uruguay", "Spania", "Grupa H"),
+    ("2026-06-27 06:00", "Noua Zeelandă", "Belgia", "Grupa G"),
+    ("2026-06-27 06:00", "Egipt", "Iran", "Grupa G"),
+    ("2026-06-28 00:00", "Panama", "Anglia", "Grupa L"),
+    ("2026-06-28 00:00", "Croația", "Ghana", "Grupa L"),
+    ("2026-06-28 02:30", "Columbia", "Portugalia", "Grupa K"),
+    ("2026-06-28 02:30", "DR Congo", "Uzbekistan", "Grupa K"),
+    ("2026-06-28 05:00", "Algeria", "Austria", "Grupa J"),
+    ("2026-06-28 05:00", "Iordania", "Argentina", "Grupa J"),
+    # ---- Șaisprezecimi (M73-M88), în ordinea numărului ----
+    ("2026-06-28 22:00", "Loc 2 Gr.A", "Loc 2 Gr.B", "Șaisprezecimi"),
+    ("2026-06-29 23:30", "Loc 1 Gr.E", "Loc 3 (A/B/C/D/F)", "Șaisprezecimi"),
+    ("2026-06-30 04:00", "Loc 1 Gr.F", "Loc 2 Gr.C", "Șaisprezecimi"),
+    ("2026-06-29 20:00", "Loc 1 Gr.C", "Loc 2 Gr.F", "Șaisprezecimi"),
+    ("2026-07-01 00:00", "Loc 1 Gr.I", "Loc 3 (C/D/F/G/H)", "Șaisprezecimi"),
+    ("2026-06-30 20:00", "Loc 2 Gr.E", "Loc 2 Gr.I", "Șaisprezecimi"),
+    ("2026-07-01 04:00", "Loc 1 Gr.A", "Loc 3 (C/E/F/H/I)", "Șaisprezecimi"),
+    ("2026-07-01 19:00", "Loc 1 Gr.L", "Loc 3 (E/H/I/J/K)", "Șaisprezecimi"),
+    ("2026-07-02 03:00", "Loc 1 Gr.D", "Loc 3 (B/E/F/I/J)", "Șaisprezecimi"),
+    ("2026-07-01 23:00", "Loc 1 Gr.G", "Loc 3 (A/E/H/I/J)", "Șaisprezecimi"),
+    ("2026-07-03 02:00", "Loc 2 Gr.K", "Loc 2 Gr.L", "Șaisprezecimi"),
+    ("2026-07-02 22:00", "Loc 1 Gr.H", "Loc 2 Gr.J", "Șaisprezecimi"),
+    ("2026-07-03 06:00", "Loc 1 Gr.B", "Loc 3 (E/F/G/I/J)", "Șaisprezecimi"),
+    ("2026-07-04 01:00", "Loc 1 Gr.J", "Loc 2 Gr.H", "Șaisprezecimi"),
+    ("2026-07-04 04:30", "Loc 1 Gr.K", "Loc 3 (D/E/I/J/L)", "Șaisprezecimi"),
+    ("2026-07-03 21:00", "Loc 2 Gr.D", "Loc 2 Gr.G", "Șaisprezecimi"),
+    # ---- Optimi (M89-M96) ----
+    ("2026-07-05 00:00", "Câșt. M74", "Câșt. M77", "Optimi"),
+    ("2026-07-04 20:00", "Câșt. M73", "Câșt. M75", "Optimi"),
+    ("2026-07-05 23:00", "Câșt. M76", "Câșt. M78", "Optimi"),
+    ("2026-07-06 03:00", "Câșt. M79", "Câșt. M80", "Optimi"),
+    ("2026-07-06 22:00", "Câșt. M83", "Câșt. M84", "Optimi"),
+    ("2026-07-07 03:00", "Câșt. M81", "Câșt. M82", "Optimi"),
+    ("2026-07-07 19:00", "Câșt. M86", "Câșt. M88", "Optimi"),
+    ("2026-07-07 23:00", "Câșt. M85", "Câșt. M87", "Optimi"),
+    # ---- Sferturi (M97-M100) ----
+    ("2026-07-09 23:00", "Câșt. M89", "Câșt. M90", "Sferturi"),
+    ("2026-07-10 22:00", "Câșt. M93", "Câșt. M94", "Sferturi"),
+    ("2026-07-12 00:00", "Câșt. M91", "Câșt. M92", "Sferturi"),
+    ("2026-07-12 04:00", "Câșt. M95", "Câșt. M96", "Sferturi"),
+    # ---- Semifinale (M101-M102) ----
+    ("2026-07-14 22:00", "Câșt. M97", "Câșt. M98", "Semifinală"),
+    ("2026-07-15 22:00", "Câșt. M99", "Câșt. M100", "Semifinală"),
+    # ---- Finala mică (M103) ----
+    ("2026-07-19 00:00", "Loc 2 M101", "Loc 2 M102", "Finala mică"),
+    # ---- Finala (M104) ----
+    ("2026-07-19 22:00", "Câșt. M101", "Câșt. M102", "Finala"),
+]
 
 
 # ------------------------------------------------------------------ #
@@ -98,7 +239,7 @@ def init_db():
                 for _tbl in ("match_predictions", "group_picks", "champion_picks", "scorer_picks",
                              "group_results", "matches", "bonus_points", "teams"):
                     c.execute(f"DROP TABLE IF EXISTS {_tbl}")
-                c.execute("DELETE FROM config WHERE key='matches_seeded'")
+                c.execute("DELETE FROM config WHERE key IN ('matches_seeded','matches_seeded_v2')")
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS users(
@@ -113,7 +254,7 @@ def init_db():
                 kickoff TEXT, stage TEXT, result TEXT, score TEXT
             );
             CREATE TABLE IF NOT EXISTS match_predictions(
-                user_id INTEGER, match_id INTEGER, pick TEXT, created_at TEXT,
+                user_id INTEGER, match_id INTEGER, pick TEXT, pred_score TEXT, created_at TEXT,
                 PRIMARY KEY(user_id, match_id)
             );
             CREATE TABLE IF NOT EXISTS group_picks(
@@ -138,35 +279,30 @@ def init_db():
         mcols = [r["name"] for r in c.execute("PRAGMA table_info(matches)").fetchall()]
         if "score" not in mcols:
             c.execute("ALTER TABLE matches ADD COLUMN score TEXT")
+        pcols = [r["name"] for r in c.execute("PRAGMA table_info(match_predictions)").fetchall()]
+        if "pred_score" not in pcols:
+            c.execute("ALTER TABLE match_predictions ADD COLUMN pred_score TEXT")
         if not c.execute("SELECT 1 FROM teams LIMIT 1").fetchone():
             for label, names in TEAMS.items():
                 for n in names:
                     c.execute("INSERT OR IGNORE INTO teams(name, group_label) VALUES(?,?)", (n, label))
         if c.execute("SELECT 1 FROM config WHERE key='open_groups'").fetchone() is None:
             c.execute("INSERT INTO config(key,value) VALUES('open_groups',?)", (DEFAULT_OPEN_GROUPS,))
-        # --- seed o singură dată: toate grupele deschise + meciuri de test ---
-        if c.execute("SELECT 1 FROM config WHERE key='matches_seeded'").fetchone() is None:
+        # --- seed v2: toate grupele deschise + meciurile reale CM 2026 (o singură dată) ---
+        if c.execute("SELECT 1 FROM config WHERE key='matches_seeded_v2'").fetchone() is None:
             c.execute("INSERT INTO config(key,value) VALUES('open_groups',?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (DEFAULT_OPEN_GROUPS,))
-            today = datetime.now(TZ).date()
-            tmrw = today + timedelta(days=1)
-            t, tm = today.strftime("%Y-%m-%d"), tmrw.strftime("%Y-%m-%d")
-            seed = [
-                (f"{t} 20:45", "România", "Țara Galilor"),
-                (f"{t} 20:45", "Portugalia", "Chile"),
-                (f"{t} 21:30", "SUA", "Germania"),
-                (f"{t} 22:00", "Elveția", "Australia"),
-                (f"{t} 23:00", "Anglia", "Noua Zeelandă"),
-                (f"{tm} 19:00", "Belgia", "Tunisia"),
-                (f"{tm} 20:00", "Bolivia", "Scoția"),
-                (f"{tm} 20:45", "Ungaria", "Finlanda"),
-                (f"{tm} 21:00", "Canada", "Irlanda"),
-                (f"{tm} 22:00", "Panama", "Bosnia și Herțegovina"),
-            ]
-            for kickoff, home, away in seed:
-                c.execute("INSERT INTO matches(home,away,kickoff,stage) VALUES(?,?,?,?)", (home, away, kickoff, "Amical"))
-            c.execute("INSERT INTO config(key,value) VALUES('matches_seeded','1')")
-            log.info("Seed: %d meciuri + toate grupele deschise.", len(seed))
+            # scot orice meciuri vechi (ex. amicalele de test) și repornesc numerotarea
+            c.execute("DELETE FROM match_predictions")
+            c.execute("DELETE FROM matches")
+            try:
+                c.execute("DELETE FROM sqlite_sequence WHERE name='matches'")
+            except sqlite3.OperationalError:
+                pass
+            for kickoff, home, away, stage in WC_MATCHES:
+                c.execute("INSERT INTO matches(home,away,kickoff,stage) VALUES(?,?,?,?)", (home, away, kickoff, stage))
+            c.execute("INSERT INTO config(key,value) VALUES('matches_seeded_v2','1')")
+            log.info("Seed v2: %d meciuri reale CM 2026 + toate grupele deschise.", len(WC_MATCHES))
 
 
 def get_config(key):
@@ -326,7 +462,8 @@ def compute_scores():
     with db() as c:
         users = c.execute("SELECT user_id, full_name, username FROM users WHERE approved=1").fetchall()
         mres = dict(c.execute("SELECT match_id, result FROM matches WHERE result IS NOT NULL").fetchall())
-        preds = c.execute("SELECT user_id, match_id, pick FROM match_predictions").fetchall()
+        mscore = dict(c.execute("SELECT match_id, score FROM matches WHERE score IS NOT NULL").fetchall())
+        preds = c.execute("SELECT user_id, match_id, pick, pred_score FROM match_predictions").fetchall()
         gres = dict(c.execute("SELECT group_label, winner_team FROM group_results").fetchall())
         gpicks = c.execute("SELECT user_id, group_label, team_name FROM group_picks").fetchall()
         cpicks = dict(c.execute("SELECT user_id, team_name FROM champion_picks").fetchall())
@@ -337,9 +474,16 @@ def compute_scores():
     ids = {u["user_id"] for u in users}
 
     m = {i: 0 for i in ids}
+    s = {i: 0 for i in ids}
     for p in preds:
-        if p["user_id"] in ids and mres.get(p["match_id"]) == p["pick"]:
-            m[p["user_id"]] += POINTS_MATCH
+        uid = p["user_id"]
+        if uid not in ids:
+            continue
+        if mres.get(p["match_id"]) == p["pick"]:
+            m[uid] += POINTS_MATCH
+            actual = mscore.get(p["match_id"])
+            if actual and p["pred_score"] and norm_score(p["pred_score"]) == norm_score(actual):
+                s[uid] += POINTS_SCORE
     g = {i: 0 for i in ids}
     for x in gpicks:
         if x["user_id"] in ids and gres.get(x["group_label"]) == x["team_name"]:
@@ -359,8 +503,8 @@ def compute_scores():
     for u in users:
         i = u["user_id"]
         b = int(bonus.get(i, 0))
-        total = m[i] + g[i] + ch[i] + sc[i] + b
-        rows.append((u, total, m[i], g[i], ch[i], sc[i], b))
+        total = m[i] + s[i] + g[i] + ch[i] + sc[i] + b
+        rows.append((u, total, m[i], g[i], ch[i], sc[i], s[i], b))
     rows.sort(key=lambda x: x[1], reverse=True)
     return rows
 
@@ -371,12 +515,12 @@ def leaderboard_text():
         return "Încă nu există participanți aprobați."
     medals = {0: "🥇", 1: "🥈", 2: "🥉"}
     out = ["🏆 CLASAMENT\n"]
-    for i, (u, total, m, g, ch, sc, b) in enumerate(rows):
+    for i, (u, total, m, g, ch, gol, s, b) in enumerate(rows):
         name = u["full_name"] or (u["username"] and "@" + u["username"]) or str(u["user_id"])
         pre = medals.get(i, f"{i + 1}.")
-        extra = f"  (M:{m} G:{g} C:{ch} Gol:{sc}" + (f" B:{b}" if b else "") + ")"
+        extra = f"  (M:{m} G:{g} C:{ch} Gol:{gol}" + (f" S:{s}" if s else "") + (f" B:{b}" if b else "") + ")"
         out.append(f"{pre} {name} — {total}p{extra}")
-    out.append("\nM=meciuri · G=grupe · C=campioană · Gol=golgheter · B=bonus")
+    out.append("\nM=meciuri · G=grupe · C=campioană · Gol=golgheter · S=scor exact · B=bonus")
     return "\n".join(out)
 
 
@@ -410,7 +554,18 @@ def group_team_keyboard(label, prefix="grp"):
     return InlineKeyboardMarkup([[InlineKeyboardButton(t["name"], callback_data=f"{prefix}:set:{label}:{t['team_id']}")] for t in teams])
 
 
-def disclaimer_text():
+def scorer_keyboard(page=0, per=8, prefix="sco"):
+    chunk = SCORERS[page * per: page * per + per]
+    rows = [[InlineKeyboardButton(name, callback_data=f"{prefix}:set:{page * per + i}")] for i, name in enumerate(chunk)]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"{prefix}:page:{page - 1}"))
+    if (page + 1) * per < len(SCORERS):
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"{prefix}:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("✍️ Alt nume (scrie tu)", callback_data=f"{prefix}:other")])
+    return InlineKeyboardMarkup(rows)
     closed = [g for g in GROUP_LABELS if g not in open_groups()]
     if not closed:
         return "✅ Toate grupele sunt deschise."
@@ -444,9 +599,8 @@ async def send_group_prompt(bot, chat_id, label):
 
 
 async def send_scorer_prompt(bot, chat_id):
-    await bot.send_message(chat_id, disclaimer_text() +
-                           "\n\n⚽️ Acum scrie numele *GOLGHETERULUI* turneului (4 puncte).\n"
-                           "Trimite-l ca mesaj normal (ex: Mbappé, Haaland, Kane).", parse_mode="Markdown")
+    await bot.send_message(chat_id, "⚽️ Alege *GOLGHETERUL* turneului (4 puncte) — apasă un nume din listă sau scrie tu altul:",
+                           parse_mode="Markdown", reply_markup=scorer_keyboard(0))
 
 
 async def start_or_resume_wizard(bot, uid):
@@ -521,17 +675,19 @@ def groups_menu(uid):
     with db() as c:
         picked = dict(c.execute("SELECT group_label, team_name FROM group_picks WHERE user_id=?", (uid,)).fetchall())
     opn = open_groups()
-    lines = ["📊 *Grupele tale:*\n"]
-    buttons = []
-    for g in GROUP_LABELS:
-        if g in picked:
-            lines.append(f"✅ Grupa {g}: {picked[g]}")
-        elif g in opn:
-            lines.append(f"🔓 Grupa {g}: de ales")
-            buttons.append([InlineKeyboardButton(f"Alege Grupa {g}", callback_data=f"grp:open:{g}")])
-        else:
-            lines.append(f"🔒 Grupa {g}: se deschide curând")
-    return "\n".join(lines), (InlineKeyboardMarkup(buttons) if buttons else None)
+    todo = [g for g in GROUP_LABELS if g in opn and g not in picked]
+    closed = [g for g in GROUP_LABELS if g not in opn and g not in picked]
+    lines = ["📊 *Grupele tale*"]
+    pl = [f"{g}: {picked[g]}" for g in GROUP_LABELS if g in picked]
+    if pl:
+        lines.append("✅ " + "  ·  ".join(pl))
+    if closed:
+        lines.append("🔒 Curând: " + ", ".join(closed))
+    if todo:
+        lines.append("👇 De ales: " + ", ".join(todo))
+    btns = [InlineKeyboardButton(g, callback_data=f"grp:open:{g}") for g in todo]
+    rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+    return "\n".join(lines), (InlineKeyboardMarkup(rows) if rows else None)
 
 
 async def cmd_grupe(update, context):
@@ -556,7 +712,7 @@ async def cmd_golgheter(update, context):
         await update.message.reply_text("⛔️ Termenul a trecut.")
         return
     set_step(uid, "scorer")
-    await update.message.reply_text("⚽️ Scrie numele golgheterului turneului (4 puncte) — trimite-l ca mesaj normal.")
+    await update.message.reply_text("⚽️ Alege golgheterul (4 puncte) — apasă un nume din listă sau scrie tu altul:", reply_markup=scorer_keyboard(0))
 
 
 async def _show_day(update, context, date_str, eticheta):
@@ -601,14 +757,14 @@ def picks_text(uid, mine=False, title=None):
         champ = c.execute("SELECT team_name FROM champion_picks WHERE user_id=?", (uid,)).fetchone()
         scorer = c.execute("SELECT name FROM scorer_picks WHERE user_id=?", (uid,)).fetchone()
         gp = c.execute("SELECT group_label, team_name FROM group_picks WHERE user_id=? ORDER BY group_label", (uid,)).fetchall()
-        mp = c.execute("SELECT m.home, m.away, mp.pick FROM match_predictions mp JOIN matches m ON m.match_id=mp.match_id WHERE mp.user_id=? ORDER BY m.kickoff", (uid,)).fetchall()
+        mp = c.execute("SELECT m.home, m.away, mp.pick, mp.pred_score FROM match_predictions mp JOIN matches m ON m.match_id=mp.match_id WHERE mp.user_id=? ORDER BY m.kickoff", (uid,)).fetchall()
     head = title or ("📋 Pronosticurile tale" if mine else "📋 Pronosticuri")
     lines = [head + "\n", f"🏆 Campioană: {champ['team_name'] if champ else '—'}",
              f"⚽️ Golgheter: {scorer['name'] if scorer else '—'}", "\n📊 Grupe:"]
     lines += [f"  • {g['group_label']}: {g['team_name']}" for g in gp] or ["  —"]
     lines.append("\n⚽️ Meciuri:")
     if mp:
-        lines += [f"  • {x['home']} vs {x['away']}: {pick_label(x['home'], x['away'], x['pick'])}" for x in mp]
+        lines += [f"  • {x['home']} vs {x['away']}: {pick_label(x['home'], x['away'], x['pick'])}" + (f" ({x['pred_score']})" if x['pred_score'] else "") for x in mp]
     else:
         lines.append("  —")
     return "\n".join(lines)
@@ -637,15 +793,19 @@ async def cmd_premii(update, context):
 # ------------------------------------------------------------------ #
 #  MECIURI — afișare/pariere
 # ------------------------------------------------------------------ #
-def match_kb(match, current=None):
+def match_kb(match, current=None, pred_score=None):
     mid = match["match_id"]
     def lbl(t, p): return ("✅ " if current == p else "") + t
-    btns = [
+    rows = [[
         InlineKeyboardButton(lbl("🏠 " + match["home"], "HOME"), callback_data=f"m:{mid}:HOME"),
         InlineKeyboardButton(lbl("🤝 Egal", "DRAW"), callback_data=f"m:{mid}:DRAW"),
         InlineKeyboardButton(lbl("✈️ " + match["away"], "AWAY"), callback_data=f"m:{mid}:AWAY"),
-    ]
-    return InlineKeyboardMarkup([btns])
+    ]]
+    if current in SCORE_OPTIONS:
+        for srow in SCORE_OPTIONS[current]:
+            rows.append([InlineKeyboardButton(("✅ " if s == pred_score else "") + s, callback_data=f"ms:{mid}:{s}") for s in srow])
+        rows.append([InlineKeyboardButton("✍️ Alt scor", callback_data=f"ms:{mid}:other")])
+    return InlineKeyboardMarkup(rows)
 
 
 def match_text(m):
@@ -663,8 +823,9 @@ def result_str(m):
 
 async def send_match_prompt(bot, chat_id, match, uid):
     with db() as c:
-        p = c.execute("SELECT pick FROM match_predictions WHERE user_id=? AND match_id=?", (uid, match["match_id"])).fetchone()
-    await bot.send_message(chat_id=chat_id, text=match_text(match), reply_markup=match_kb(match, p["pick"] if p else None))
+        p = c.execute("SELECT pick, pred_score FROM match_predictions WHERE user_id=? AND match_id=?", (uid, match["match_id"])).fetchone()
+    await bot.send_message(chat_id=chat_id, text=match_text(match),
+                           reply_markup=match_kb(match, p["pick"] if p else None, p["pred_score"] if p else None))
 
 
 # ------------------------------------------------------------------ #
@@ -738,12 +899,89 @@ async def cb_match(update, context):
         await q.answer("Meci inexistent."); return
     if not match_open(m["kickoff"]):
         await q.answer("⛔️ Meciul a început.", show_alert=True); return
-    await q.answer(f"Salvat: {pick_label(m['home'], m['away'], pick)} ✅")
+    await q.answer(f"{pick_label(m['home'], m['away'], pick)} ✅ — alege și scorul pentru +2p")
     with db() as c:
+        ex = c.execute("SELECT pick, pred_score FROM match_predictions WHERE user_id=? AND match_id=?", (uid, mid)).fetchone()
+        changed = (not ex) or ex["pick"] != pick
         c.execute("INSERT INTO match_predictions(user_id, match_id, pick, created_at) VALUES(?,?,?,?) "
                   "ON CONFLICT(user_id, match_id) DO UPDATE SET pick=excluded.pick, created_at=excluded.created_at",
                   (uid, mid, pick, now_local().isoformat()))
-    await q.edit_message_reply_markup(reply_markup=match_kb(m, pick))
+        if changed:
+            c.execute("UPDATE match_predictions SET pred_score=NULL WHERE user_id=? AND match_id=?", (uid, mid))
+        ps = None if changed else (ex["pred_score"] if ex else None)
+    await q.edit_message_reply_markup(reply_markup=match_kb(m, pick, ps))
+
+
+async def cb_score(update, context):
+    q = update.callback_query
+    parts = q.data.split(":")
+    uid = q.from_user.id
+    mid = int(parts[1])
+    if not is_approved(uid):
+        await q.answer("Aștepți aprobarea.", show_alert=True); return
+    if not onboarding_done(uid):
+        await q.answer("Întâi campioana și grupele (/start).", show_alert=True); return
+    with db() as c:
+        m = c.execute("SELECT * FROM matches WHERE match_id=?", (mid,)).fetchone()
+        ex = c.execute("SELECT pick FROM match_predictions WHERE user_id=? AND match_id=?", (uid, mid)).fetchone()
+    if not m:
+        await q.answer("Meci inexistent."); return
+    if not match_open(m["kickoff"]):
+        await q.answer("⛔️ Meciul a început.", show_alert=True); return
+    if not ex:
+        await q.answer("Alege întâi cine câștigă.", show_alert=True); return
+    pick = ex["pick"]
+    if parts[2] == "other":
+        await q.answer()
+        context.user_data["await_pred_score_for"] = mid
+        await context.bot.send_message(uid, f"✍️ Scrie scorul pentru {m['home']} vs {m['away']} (ex: 2-1):")
+        return
+    score = parts[2]
+    await q.answer(f"Scor {score} ✅ (+2p dacă nimerești)")
+    with db() as c:
+        c.execute("UPDATE match_predictions SET pred_score=? WHERE user_id=? AND match_id=?", (score, uid, mid))
+    await q.edit_message_reply_markup(reply_markup=match_kb(m, pick, score))
+
+
+async def cb_scorer(update, context):
+    q = update.callback_query
+    parts = q.data.split(":")
+    uid = q.from_user.id
+    if parts[1] == "page":
+        await q.answer(); await q.edit_message_reply_markup(reply_markup=scorer_keyboard(int(parts[2]))); return
+    if not is_approved(uid):
+        await q.answer("Aștepți aprobarea.", show_alert=True); return
+    if has_scorer(uid):
+        await q.answer("Golgheterul e ales deja, nu se poate schimba.", show_alert=True); return
+    if not picks_open():
+        await q.answer("Termenul a trecut.", show_alert=True); return
+    if parts[1] == "other":
+        await q.answer(); set_step(uid, "scorer")
+        await q.edit_message_text("✍️ Scrie numele golgheterului (trimite-l ca mesaj normal)."); return
+    if parts[1] == "set":
+        name = SCORERS[int(parts[2])]
+        await q.answer()
+        with db() as c:
+            c.execute("INSERT OR IGNORE INTO scorer_picks(user_id, name) VALUES(?,?)", (uid, name))
+        await q.edit_message_text(f"✅ Golgheter: {name} (blocat)")
+        if get_step(uid) in ("scorer", ""):
+            await start_or_resume_wizard(context.bot, uid)
+
+
+async def cb_setscorer_pick(update, context):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer(); return
+    parts = q.data.split(":")
+    if parts[1] == "page":
+        await q.answer(); await q.edit_message_reply_markup(reply_markup=scorer_keyboard(int(parts[2]), prefix="ssco")); return
+    if parts[1] == "other":
+        await q.answer(); await q.edit_message_text("Scrie: /setscorer NumeJucător"); return
+    if parts[1] == "set":
+        name = SCORERS[int(parts[2])]
+        await q.answer()
+        set_config("scorer_winner", name)
+        await q.edit_message_text(f"✅ Golgheterul real: {name}. Punctaje actualizate.")
 
 
 # ------------------------------------------------------------------ #
@@ -763,9 +1001,28 @@ async def on_text(update, context):
                     c.execute("UPDATE matches SET score=? WHERE match_id=?", (score, mid))
             await update.message.reply_text(f"✅ Scor salvat la meciul #{mid}: {score}")
             return
-    # JUCĂTOR — captură golgheter
     if not is_approved(uid):
         return
+    # JUCĂTOR — scor prezis (după „Alt scor")
+    mid_ps = context.user_data.get("await_pred_score_for")
+    if mid_ps:
+        raw = (update.message.text or "").strip()
+        mm = re.match(r"^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$", raw)
+        if not mm:
+            await update.message.reply_text("Scrie scorul ca număr-număr, ex: 2-1.")
+            return
+        context.user_data.pop("await_pred_score_for", None)
+        score = f"{int(mm.group(1))}-{int(mm.group(2))}"
+        with db() as c:
+            ok = c.execute("SELECT 1 FROM match_predictions WHERE user_id=? AND match_id=?", (uid, mid_ps)).fetchone()
+            m = c.execute("SELECT * FROM matches WHERE match_id=?", (mid_ps,)).fetchone()
+            if ok and m and match_open(m["kickoff"]):
+                c.execute("UPDATE match_predictions SET pred_score=? WHERE user_id=? AND match_id=?", (score, uid, mid_ps))
+                await update.message.reply_text(f"✅ Scor salvat: {m['home']} {score} {m['away']} (+2p dacă nimerești)")
+            else:
+                await update.message.reply_text("Nu am putut salva scorul (meci închis sau lipsă pronostic 1/X/2).")
+        return
+    # JUCĂTOR — captură golgheter
     if get_step(uid) == "scorer" and not has_scorer(uid):
         name = (update.message.text or "").strip()
         if not name:
@@ -927,13 +1184,13 @@ async def cmd_matchpicks(update, context):
         m = c.execute("SELECT * FROM matches WHERE match_id=?", (mid,)).fetchone()
         if not m:
             await update.message.reply_text("Meci inexistent."); return
-        rows = c.execute("SELECT u.full_name, mp.pick FROM match_predictions mp JOIN users u ON u.user_id=mp.user_id WHERE mp.match_id=? AND u.approved=1 ORDER BY u.full_name", (mid,)).fetchall()
+        rows = c.execute("SELECT u.full_name, mp.pick, mp.pred_score FROM match_predictions mp JOIN users u ON u.user_id=mp.user_id WHERE mp.match_id=? AND u.approved=1 ORDER BY u.full_name", (mid,)).fetchall()
     out = [f"⚽️ {m['home']} vs {m['away']} ({m['stage']}):\n"]
     if not rows:
         out.append("Nimeni n-a pariat încă.")
     else:
         for r in rows:
-            out.append(f"• {r['full_name']}: {pick_label(m['home'], m['away'], r['pick'])}")
+            out.append(f"• {r['full_name']}: {pick_label(m['home'], m['away'], r['pick'])}" + (f" ({r['pred_score']})" if r['pred_score'] else ""))
     if m["result"]:
         out.append(f"\nRezultat: {result_str(m)}")
     await update.message.reply_text("\n".join(out))
@@ -1265,11 +1522,11 @@ async def cb_setchamp(update, context):
 async def cmd_setscorer(update, context):
     if not is_admin(update):
         return
-    if not context.args:
-        await update.message.reply_text("Format: /setscorer <nume golgheter>\nEx: /setscorer Mbappé")
+    if context.args:
+        set_config("scorer_winner", " ".join(context.args))
+        await update.message.reply_text(f"✅ Golgheterul real: {' '.join(context.args)}. Punctaje actualizate.")
         return
-    set_config("scorer_winner", " ".join(context.args))
-    await update.message.reply_text(f"✅ Golgheterul real: {' '.join(context.args)}. Punctaje actualizate.")
+    await update.message.reply_text("Alege golgheterul real (sau /setscorer <nume>):", reply_markup=scorer_keyboard(0, prefix="ssco"))
 
 
 async def cmd_setpot(update, context):
@@ -1512,8 +1769,11 @@ def main():
     app.add_handler(CommandHandler("reset_all", cmd_reset_all))
 
     app.add_handler(CallbackQueryHandler(cb_champ, pattern=r"^champ:"))
+    app.add_handler(CallbackQueryHandler(cb_scorer, pattern=r"^sco:"))
+    app.add_handler(CallbackQueryHandler(cb_setscorer_pick, pattern=r"^ssco:"))
     app.add_handler(CallbackQueryHandler(cb_grp, pattern=r"^grp:"))
     app.add_handler(CallbackQueryHandler(cb_match, pattern=r"^m:"))
+    app.add_handler(CallbackQueryHandler(cb_score, pattern=r"^ms:"))
     app.add_handler(CallbackQueryHandler(cb_approve, pattern=r"^appr:"))
     app.add_handler(CallbackQueryHandler(cb_view, pattern=r"^view:"))
     app.add_handler(CallbackQueryHandler(cb_setres, pattern=r"^sres:"))
