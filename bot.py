@@ -1152,7 +1152,7 @@ async def cmd_allpicks(update, context):
         flag = "✅" if u["step"] == "done" else "⏳"
         out.append(f"{flag} {u['full_name']} — 🏆 {champs.get(i,'—')} | ⚽️ {scorers.get(i,'—')} | Gr {gc.get(i,0)}/{len(open_groups())} | Meci {mc.get(i,0)}")
     out.append("\nDetalii: /picks <nume>")
-    await update.message.reply_text("\n".join(out))
+    await reply_chunked(update.message, out)
 
 
 async def cmd_picks(update, context):
@@ -1224,7 +1224,7 @@ async def cmd_statusazi(update, context):
             out.append(f"🟡 {u['full_name']} — {len(s)}/{len(ids)} (lipsesc: {', '.join(missing)})")
     if nimeni:
         out.append("\n❌ N-au pus NIMIC azi: " + ", ".join(nimeni))
-    await update.message.reply_text("\n".join(out))
+    await reply_chunked(update.message, out)
 
 
 # ------------------------------------------------------------------ #
@@ -1376,6 +1376,21 @@ async def cmd_delmatch(update, context):
     await update.message.reply_text(f"🗑 Șters meciul #{mid} ({m['home']} vs {m['away']}).")
 
 
+async def reply_chunked(message, lines, limit=3500):
+    """Trimite o listă de linii în mai multe mesaje, ca să nu depășească limita Telegram."""
+    buf = ""
+    for line in lines:
+        piece = ("\n" if buf else "") + line
+        if len(buf) + len(piece) > limit:
+            if buf:
+                await message.reply_text(buf)
+            buf = line
+        else:
+            buf += piece
+    if buf:
+        await message.reply_text(buf)
+
+
 async def cmd_listmatches(update, context):
     if not is_admin(update):
         return
@@ -1383,11 +1398,11 @@ async def cmd_listmatches(update, context):
         ms = c.execute("SELECT * FROM matches ORDER BY kickoff").fetchall()
     if not ms:
         await update.message.reply_text("Niciun meci."); return
-    out = []
+    out = [f"📋 {len(ms)} meciuri:"]
     for m in ms:
         r = result_str(m)
         out.append(f"#{m['match_id']} · {m['kickoff']} · {m['home']} vs {m['away']} [{m['stage']}]" + (f" → {r}" if r else ""))
-    await update.message.reply_text("\n".join(out))
+    await reply_chunked(update.message, out)
 
 
 # ------------------------------------------------------------------ #
